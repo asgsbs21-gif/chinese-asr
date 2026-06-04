@@ -14,6 +14,24 @@ Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
 def sse(event, data):
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+# ── Short link resolver ───────────────────────────────────────────
+async def resolve_ks_url(url: str) -> str:
+    """v.kuaishou.com short link → full URL"""
+    if "/short-video/" in url or "/video/" in url or "/photo/" in url:
+        return url  # already full URL
+    try:
+        async with httpx.AsyncClient(
+            timeout=10,
+            follow_redirects=False,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        ) as client:
+            resp = await client.get(url)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                return resp.headers.get("location", url)
+    except Exception:
+        pass
+    return url
+
 # ── KS-Downloader: video URL বের করো ─────────────────────────────
 async def get_ks_video_url(page_url: str) -> str:
     payload = {
@@ -98,8 +116,10 @@ def transcribe_stream(url: str, groq_key: str):
     mp3_path   = os.path.join(TEMP_DIR, f"{job_id}.mp3")
 
     try:
+        yield sse("log", {"msg": "⏳ Resolving Kuaishou URL..."})
+        resolved = asyncio.run(resolve_ks_url(url))
         yield sse("log", {"msg": "⏳ Getting video URL from KS-Downloader..."})
-        video_url = asyncio.run(get_ks_video_url(url))
+        video_url = asyncio.run(get_ks_video_url(resolved))
         yield sse("log", {"msg": "✅ Video URL found"})
 
         yield sse("log", {"msg": "⬇ Downloading video..."})
