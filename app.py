@@ -251,6 +251,34 @@ async def groq_transcribe(mp3_path: str, groq_keys: list[str], language: str = "
     raise ValueError(str(last_error or "All Groq keys failed"))
 
 
+def split_long_segments(segments: list, max_dur: float = 8.0) -> list:
+    """Split segments longer than max_dur into equal time chunks."""
+    result = []
+    for seg in segments:
+        start = seg["start"]
+        end = seg["end"]
+        text = seg["text"]
+        dur = end - start
+        if dur <= max_dur:
+            result.append(seg)
+            continue
+        n = max(2, int(dur / max_dur) + 1)
+        words = text.split()
+        time_step = dur / n
+        chunk_size = max(1, len(words) // n)
+        for i in range(n):
+            t_start = start + i * time_step
+            t_end = start + (i + 1) * time_step if i < n - 1 else end
+            if i < n - 1:
+                chunk_words = words[i * chunk_size:(i + 1) * chunk_size]
+            else:
+                chunk_words = words[i * chunk_size:]
+            chunk_text = " ".join(chunk_words).strip()
+            if chunk_text:
+                result.append({"start": round(t_start, 3), "end": round(t_end, 3), "text": chunk_text})
+    return result
+
+
 def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
     job_id = f"asr_{int(time.time())}"
     video_path = os.path.join(TEMP_DIR, f"{job_id}.mp4")
@@ -286,6 +314,8 @@ def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
                     "text": (seg.get("text") or "").strip(),
                 }
             )
+
+        segments = split_long_segments(segments, max_dur=8.0)
 
         yield sse(
             "done",
