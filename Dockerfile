@@ -9,8 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir \
   httpx[socks] aiofiles aiosqlite lxml pyyaml rich uvicorn fastapi emoji
 
-# ─── Flask deps ───────────────────────────────────────────────────
-RUN pip install --no-cache-dir flask httpx
+# ─── Flask deps + edge‑tts ────────────────────────────────────────
+RUN pip install --no-cache-dir flask httpx edge-tts
 
 # ─── App ──────────────────────────────────────────────────────────
 WORKDIR /app
