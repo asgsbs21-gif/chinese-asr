@@ -207,7 +207,7 @@ button#submitBtn:disabled { background: #333; color: #666; cursor: not-allowed; 
 
     <hr style="border:none;border-top:1px solid #2a2a2a;margin:14px 0">
 
-    <label>Gemini API Keys <span style="font-size:12px;color:#666">(TTS এর জন্য, প্রতি লাইনে একটা)</span></label>
+    <label>Gemini API Keys <span style="font-size:12px;color:#666">(TTS, optional — না দিলে Edge‑TTS)</span></label>
     <textarea id="dubGeminiKeys" placeholder="AIza...&#10;AIza..." style="min-height:70px"></textarea>
 
     <label style="margin-top:4px">Groq API Keys <span style="font-size:12px;color:#666">(Translation এর জন্য — Gemini এর বিকল্প)</span></label>
@@ -743,33 +743,39 @@ async function dubCallServerTTS(text, voice = 'bn-IN-TanishaaNeural', pitch = '-
   return arr;
 }
 
-async function getTTSSegment(text, geminiVoice, geminiKeys) {
-  // প্রথমে Gemini দিয়ে চেষ্টা
-  let keyIdx = 0;
-  const MAX_ATTEMPTS = 10;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const key = geminiKeys[keyIdx % geminiKeys.length];
-    keyIdx++;
-    try {
-      const pcm = await dubCallGemini(text, geminiVoice, key);
-      return pcm;
-    } catch(e) {
-      if (e.code === 429) {
-        const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
-        await new Promise(r => setTimeout(r, delay));
-      } else {
-        break;
+async function getTTSSegment(text, geminiVoice, geminiKeys, segIdx, total) {
+  // Gemini থাকলে চেষ্টা করবে, না থাকলে সরাসরি Edge‑TTS
+  if (geminiKeys.length > 0) {
+    let keyIdx = 0;
+    const MAX_ATTEMPTS = 10;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const key = geminiKeys[keyIdx % geminiKeys.length];
+      keyIdx++;
+      try {
+        const pcm = await dubCallGemini(text, geminiVoice, key);
+        document.getElementById('dubProgress').textContent =
+          `🔊 TTS ${segIdx+1}/${total} (Gemini ✅): "${text.substring(0,25)}..."`;
+        return pcm;
+      } catch(e) {
+        if (e.code === 429) {
+          const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+          await new Promise(r => setTimeout(r, delay));
+        } else {
+          break; // Gemini কাজ করবে না → Edge-এ যাও
+        }
       }
     }
   }
 
-  // Gemini কাজ করেনি → fallback edge‑tts
+  // Edge‑TTS fallback (অথবা একমাত্র অপশন)
+  document.getElementById('dubProgress').textContent =
+    `🔊 TTS ${segIdx+1}/${total} (Edge‑TTS): "${text.substring(0,25)}..."`;
   const pitch = document.getElementById('fallbackPitch').value;
   const speed = document.getElementById('fallbackSpeed').value;
   return await dubCallServerTTS(text, 'bn-IN-TanishaaNeural', pitch, speed);
 }
 
-// ── Start Dubbing ──────────────────────────────────────────────────────────
+// ── Start Dubbing (Gemini ছাড়াও কাজ করে) ──────────────────────────────────
 async function startDubbing() {
   const keysRaw = document.getElementById('dubGeminiKeys').value.trim();
   const voice   = document.getElementById('dubVoice').value;
@@ -777,11 +783,10 @@ async function startDubbing() {
   const progress = document.getElementById('dubProgress');
   const btn      = document.getElementById('dubBtn');
 
-  if (!keysRaw) { alert('Gemini API keys দিন'); return; }
   if (!videoUrl) { alert('Video URL নেই'); return; }
   if (!dubParsedSegments.length) { alert('আগে SRT parse করুন'); return; }
 
-  const geminiKeys = keysRaw.split('\n').map(k => k.trim()).filter(Boolean);
+  const geminiKeys = keysRaw ? keysRaw.split('\n').map(k => k.trim()).filter(Boolean) : [];
   const segments = dubParsedSegments.filter(s => s.text);
 
   if (!segments.length) { alert('কমপক্ষে একটা translation দিন'); return; }
@@ -793,20 +798,17 @@ async function startDubbing() {
 
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
-    progress.textContent = `⏳ TTS ${i+1}/${segments.length}: "${seg.text.substring(0,30)}..."`;
-
     try {
-      const pcm = await getTTSSegment(seg.text, voice, geminiKeys);
+      const pcm = await getTTSSegment(seg.text, voice, geminiKeys, i, segments.length);
       audioSegments.push({ start: seg.start, end: seg.end, pcm });
     } catch(e) {
       progress.textContent = `❌ Segment ${i+1} error: ${e.message}`;
     }
-
     await new Promise(r => setTimeout(r, 50));
   }
 
   if (audioSegments.length === 0) {
-    progress.textContent = '❌ No audio segments generated.';
+    progress.textContent = '❌ No audio segments generated. Check server logs or try Edge‑TTS.';
     btn.disabled = false;
     return;
   }
