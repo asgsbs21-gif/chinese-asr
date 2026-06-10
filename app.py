@@ -18,10 +18,84 @@ app = Flask(__name__)
 
 TEMP_DIR = os.environ.get("TEMP_DIR", "/tmp/asr")
 KS_API = os.environ.get("KS_API", "http://localhost:5557")
-KS_PROXY = os.environ.get("KS_PROXY", "").strip()
+KS_PROXY  = os.environ.get("KS_PROXY", "").strip()
 KS_COOKIE = os.environ.get("KS_COOKIE", "").strip()
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "/app/data/cookies/cookies.txt")
+YTDLP_PROXY  = os.environ.get("YTDLP_PROXY", "").strip()
 
 Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+
+
+# ─── Platform detection ───────────────────────────────────────────
+def get_platform(url: str) -> str:
+    if re.search(r'instagram\.com', url, re.I):        return 'instagram'
+    if re.search(r'tiktok\.com|vm\.tiktok\.com', url, re.I): return 'tiktok'
+    if re.search(r'kuaishou\.com|v\.kuaishou\.com', url, re.I): return 'kuaishou'
+    if re.search(r'youtube\.com|youtu\.be', url, re.I): return 'youtube'
+    return 'unknown'
+
+
+# ─── yt-dlp download (YouTube / TikTok / Instagram) ──────────────
+def ytdlp_download(url: str, out_dir: str, job_log_fn=None) -> str:
+    """Download via yt-dlp, return path to downloaded mp4."""
+    platform = get_platform(url)
+    is_yt = platform == 'youtube'
+
+    fmt = 'b[height<=720][ext=mp4]/bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
+    out_tpl = os.path.join(out_dir, 'dl_%(id)s.%(ext)s')
+
+    args = [
+        'yt-dlp', '--no-warnings', '--newline', '--no-playlist',
+        '--retries', '5', '--fragment-retries', '5', '--retry-sleep', '2',
+        '--socket-timeout', '60',
+        '--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+        '--add-header', 'Accept-Language:en-US,en;q=0.9',
+        '-f', fmt, '--merge-output-format', 'mp4',
+        '-o', out_tpl, url,
+    ]
+
+    # YouTube only — proxy + cookies + deno
+    if is_yt:
+        if YTDLP_PROXY:
+            args += ['--proxy', YTDLP_PROXY]
+        if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 100:
+            args += ['--cookies', COOKIES_FILE]
+        try:
+            subprocess.run(['deno', '--version'], capture_output=True, check=True)
+            args += ['--extractor-args', 'youtube:jsruntime=deno']
+        except Exception:
+            pass
+
+    if platform == 'tiktok':
+        args += ['--extractor-args', 'tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com']
+
+    if job_log_fn:
+        job_log_fn(f"▶ yt-dlp [{platform}] starting...")
+
+    result = subprocess.run(args, capture_output=True, text=True, timeout=300)
+    if job_log_fn and result.stdout:
+        for line in result.stdout.strip().split('\n'):
+            if line: job_log_fn(f"yt-dlp> {line}")
+
+    # pick largest mp4
+    pick, pick_size = None, 0
+    for f in os.listdir(out_dir):
+        if not f.startswith('dl_') or f.endswith('.part'): continue
+        sz = os.path.getsize(os.path.join(out_dir, f))
+        if sz > pick_size:
+            pick_size = sz
+            pick = f
+
+    if not pick or pick_size < 50 * 1024:
+        raise ValueError(f"yt-dlp: no usable mp4 (exit {result.returncode})\n{result.stderr[-300:]}")
+
+    final = os.path.join(out_dir, 'downloaded.mp4')
+    os.rename(os.path.join(out_dir, pick), final)
+    if job_log_fn:
+        job_log_fn(f"✅ yt-dlp OK ({pick_size/1024/1024:.1f} MB)")
+    return final
+
+
 
 PHOTO_ID_RE = re.compile(r"/(?:short-video|video|photo)/([A-Za-z0-9_-]+)")
 
@@ -288,19 +362,29 @@ def split_long_segments(segments: list, max_dur: float = 8.0) -> list:
 
 def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
     job_id = f"asr_{int(time.time())}"
+    work_dir  = os.path.join(TEMP_DIR, job_id)
     video_path = os.path.join(TEMP_DIR, f"{job_id}.mp4")
     mp3_path = os.path.join(TEMP_DIR, f"{job_id}.mp3")
     groq_keys = parse_groq_keys(groq_keys_raw)
+    Path(work_dir).mkdir(parents=True, exist_ok=True)
 
     try:
-        yield sse("log", {"msg": "⏳ Getting video URL..."})
-        video_url, meta, strategy = asyncio.run(get_ks_video_url(url))
-        caption = (meta or {}).get("caption") or (meta or {}).get("photoId") or "Kuaishou"
-        yield sse("log", {"msg": f"✅ Video URL found via {strategy}"})
-        yield sse("log", {"msg": f"🎬 Source: {caption}"})
+        platform = get_platform(url)
+        yield sse("log", {"msg": f"🔍 Platform: {platform.upper()}"})
 
-        yield sse("log", {"msg": "⬇ Downloading video..."})
-        asyncio.run(download_video(video_url, video_path))
+        if platform == 'kuaishou':
+            yield sse("log", {"msg": "⏳ Getting Kuaishou video URL..."})
+            video_url, meta, strategy = asyncio.run(get_ks_video_url(url))
+            caption = (meta or {}).get("caption") or (meta or {}).get("photoId") or "Kuaishou"
+            yield sse("log", {"msg": f"✅ Video URL found via {strategy}"})
+            yield sse("log", {"msg": f"🎬 Source: {caption}"})
+            yield sse("log", {"msg": "⬇ Downloading video..."})
+            asyncio.run(download_video(video_url, video_path))
+        else:
+            yield sse("log", {"msg": f"⬇ Downloading via yt-dlp ({platform})..."})
+            def log_fn(msg): pass  # SSE এর ভেতরে yield করা যায় না, তাই silent
+            video_path = ytdlp_download(url, work_dir, log_fn)
+
         size_mb = os.path.getsize(video_path) / 1024 / 1024
         yield sse("log", {"msg": f"✅ Downloaded ({size_mb:.1f} MB)"})
 
@@ -474,8 +558,12 @@ def dub():
     out_path   = os.path.join(job_dir, "dubbed.mp4")
 
     try:
-        video_dl_url, _, _ = asyncio.run(get_ks_video_url(video_url))
-        asyncio.run(download_video(video_dl_url, video_path))
+        platform = get_platform(video_url)
+        if platform == 'kuaishou':
+            video_dl_url, _, _ = asyncio.run(get_ks_video_url(video_url))
+            asyncio.run(download_video(video_dl_url, video_path))
+        else:
+            video_path = ytdlp_download(video_url, job_dir)
 
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path],
