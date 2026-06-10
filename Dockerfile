@@ -31,7 +31,15 @@ echo "[startup] Starting KS-Downloader API on :5557..."\n\
 cd /app/ks-downloader && PYTHONPATH=/app/ks-downloader python main.py api --host 0.0.0.0 --port 5557 >> /tmp/ks-api.log 2>&1 &\n\
 KS_PID=$!\n\
 echo "[startup] KS-Downloader PID=$KS_PID"\n\
-sleep 8\n\
+i=0\n\
+while [ $i -lt 30 ]; do\n\
+  if curl -sf http://localhost:5557/docs > /dev/null 2>&1; then\n\
+    echo "[startup] KS-API ready after ${i}s"\n\
+    break\n\
+  fi\n\
+  sleep 1\n\
+  i=$((i+1))\n\
+done\n\
 echo "[startup] KS-API log:"\n\
 cat /tmp/ks-api.log\n\
 echo "[startup] Starting Flask on :${PORT}"\n\
