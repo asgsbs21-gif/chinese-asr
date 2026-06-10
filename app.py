@@ -462,7 +462,7 @@ def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
 @app.route("/synthesize", methods=["POST"])
 def synthesize():
     data = request.get_json(force=True)
-    text = data.get("text", "").strip()
+    text  = data.get("text", "").strip()
     voice = data.get("voice", "bn-IN-TanishaaNeural")
     pitch = data.get("pitch", "-5%")
     rate  = data.get("rate", "+12%")
@@ -473,26 +473,27 @@ def synthesize():
     mp3_path = None
     wav_path = None
     try:
-        # mp3 ফাইল আগে বানাই
         fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
         os.close(fd)
 
-        # edge‑tts Communicate.save() ব্যবহার (স্থিতিশীল)
-        async def gen_mp3():
-            communicate = edge_tts.Communicate(text, voice, pitch=pitch, rate=rate)
-            await communicate.save(mp3_path)
+        # edge-tts CLI — asyncio.run() এর বদলে subprocess (Flask threaded safe)
+        result = subprocess.run([
+            "edge-tts",
+            "--voice", voice,
+            "--pitch", pitch,
+            "--rate", rate,
+            "--text", text,
+            "--write-media", mp3_path,
+        ], capture_output=True, text=True, timeout=60)
 
-        asyncio.run(gen_mp3())
+        if result.returncode != 0:
+            raise ValueError(f"edge-tts failed: {result.stderr[-200:]}")
 
-        # wav ফাইল
         fd, wav_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         subprocess.run([
-            "ffmpeg", "-y",
-            "-i", mp3_path,
-            "-ar", "24000",
-            "-ac", "1",
-            "-sample_fmt", "s16",
+            "ffmpeg", "-y", "-i", mp3_path,
+            "-ar", "24000", "-ac", "1", "-sample_fmt", "s16",
             wav_path
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -508,6 +509,9 @@ def synthesize():
         for p in (mp3_path, wav_path):
             if p and os.path.exists(p):
                 try:
+                    os.unlink(p)
+                except Exception:
+                    pass
                     os.unlink(p)
                 except Exception:
                     pass
