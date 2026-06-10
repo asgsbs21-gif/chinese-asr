@@ -536,6 +536,7 @@ async function dubAutoTranslate() {
   dubParsedSegments = [];
 
   const BATCH = provider === 'groq' ? 15 : 20;
+  const MAX_ATTEMPTS_PER_BATCH = 30; // total tries before giving up on a batch
   let keyIdx = 0;
   let allTranslated = [];
 
@@ -545,9 +546,14 @@ async function dubAutoTranslate() {
 
     const prompt = `Translate the following subtitles to ${lang}.\nReturn ONLY a JSON array of translated strings in the same order, no explanation, no markdown.\nExample: ["translation1","translation2"]\n\nSubtitles:\n${batch.map((s,j) => `${j+1}. ${s.text}`).join('\n')}`;
 
-    let done = false; let attempts = 0;
-    while (!done && attempts < keys.length) {
-      const key = keys[keyIdx % keys.length]; keyIdx++; attempts++;
+    let batchDone = false;
+    let attempts = 0;
+
+    while (!batchDone && attempts < MAX_ATTEMPTS_PER_BATCH) {
+      const key = keys[keyIdx % keys.length];
+      keyIdx++;
+      attempts++;
+
       try {
         let translations;
         if (provider === 'gemini') {
@@ -592,21 +598,27 @@ async function dubAutoTranslate() {
         batch.forEach((seg, j) => {
           allTranslated.push({ start: seg.start, end: seg.end, text: translations[j] || seg.text });
         });
-        done = true;
+        batchDone = true;
       } catch(e) {
         if (e.code === 429) {
-          await new Promise(r => setTimeout(r, 600));
+          // Exponential backoff + jitter
+          const delay = Math.min(1000 * Math.pow(2, attempts), 30000) + Math.random() * 1000;
+          status.textContent = `⏳ Rate limited, retrying in ${(delay/1000).toFixed(1)}s...`;
+          await new Promise(r => setTimeout(r, delay));
         } else {
-          status.textContent = `\u274C Error: ${e.message}`;
-          done = true;
+          status.textContent = `❌ Error: ${e.message}`;
+          batchDone = true; // non-retryable, move on (but keep previous translations)
         }
       }
+    }
+    if (attempts >= MAX_ATTEMPTS_PER_BATCH && !batchDone) {
+      status.textContent = `❌ Batch failed after ${MAX_ATTEMPTS_PER_BATCH} attempts.`;
     }
     await new Promise(r => setTimeout(r, 200));
   }
 
   dubParsedSegments = allTranslated;
-  status.textContent = `\u2705 ${dubParsedSegments.length}\u09C1া segment translate হয়েছে (${provider})`;
+  status.textContent = `✅ ${dubParsedSegments.length}টা segment translate হয়েছে (${provider})`;
 
   showDubPreview();
   btn.disabled = false;
@@ -685,7 +697,6 @@ async function dubCallGemini(text, voice, apiKey) {
   const data = await resp.json();
   const b64 = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
   if (!b64) throw new Error('No audio data');
-  // decode base64 PCM → ArrayBuffer
   const bin = atob(b64);
   const arr = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
@@ -711,31 +722,52 @@ async function startDubbing() {
   btn.disabled = true;
   document.getElementById('dubVideoWrap').style.display = 'none';
 
-  // Step 1: Generate TTS for each segment
-  progress.textContent = `⏳ TTS generating (0/${segments.length})...`;
+  // ---------------------------
+  // FIXED TTS generation loop
+  // ---------------------------
+  const MAX_TTS_ATTEMPTS = 30;   // per segment
   let keyIdx = 0;
   const audioSegments = [];
 
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
     progress.textContent = `⏳ TTS ${i+1}/${segments.length}: "${seg.text.substring(0,30)}..."`;
-    let done = false; let attempts = 0;
-    while (!done && attempts < keys.length) {
-      const key = keys[keyIdx % keys.length]; keyIdx++; attempts++;
+
+    let done = false;
+    let attempts = 0;
+
+    while (!done && attempts < MAX_TTS_ATTEMPTS) {
+      const key = keys[keyIdx % keys.length];
+      keyIdx++;
+      attempts++;
+
       try {
         const pcm = await dubCallGemini(seg.text, voice, key);
         audioSegments.push({ start: seg.start, end: seg.end, pcm });
         done = true;
       } catch(e) {
         if (e.code === 429) {
-          await new Promise(r => setTimeout(r, 300));
+          // Exponential backoff + jitter: 2^attempts seconds max 30s
+          const delay = Math.min(1000 * Math.pow(2, attempts), 30000) + Math.random() * 1000;
+          progress.textContent = `⏳ TTS ${i+1}/${segments.length}: rate limited, waiting ${(delay/1000).toFixed(1)}s...`;
+          await new Promise(r => setTimeout(r, delay));
+          // Continue loop, will try next key (or same key if only one key exists)
         } else {
           progress.textContent = `❌ Segment ${i+1} error: ${e.message}`;
-          done = true;
+          done = true; // non‑retryable error, skip this segment
         }
       }
     }
-    await new Promise(r => setTimeout(r, 150));
+    if (attempts >= MAX_TTS_ATTEMPTS && !done) {
+      progress.textContent = `❌ Segment ${i+1} failed after ${MAX_TTS_ATTEMPTS} attempts.`;
+    }
+    await new Promise(r => setTimeout(r, 100)); // small pause between segments
+  }
+
+  if (audioSegments.length === 0) {
+    progress.textContent = '❌ No audio segments generated. Check keys/quota.';
+    btn.disabled = false;
+    return;
   }
 
   progress.textContent = `✅ TTS done (${audioSegments.length}/${segments.length}). Sending to server...`;
