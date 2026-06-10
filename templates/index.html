@@ -138,6 +138,39 @@ button#submitBtn:disabled { background: #333; color: #666; cursor: not-allowed; 
   .seg { flex-direction: column; gap: 4px; }
   .seg .ts { min-width: auto; }
 }
+/* Dubbing */
+.dub-seg {
+  display: flex; gap: 10px; padding: 8px 0;
+  border-bottom: 1px solid #222; align-items: flex-start;
+}
+.dub-seg:last-child { border-bottom: none; }
+.dub-seg .ts {
+  color: #e63946; font-family: monospace; font-size: 0.78rem;
+  min-width: 110px; padding-top: 8px;
+}
+.dub-seg .orig { color: #777; font-size: 0.82rem; flex: 1; padding-top: 8px; line-height: 1.5; }
+.dub-seg textarea {
+  flex: 1.5; min-height: 52px; font-size: 0.88rem;
+  padding: 6px 10px; margin-bottom: 0; resize: vertical;
+}
+.dub-progress {
+  font-size: 0.84rem; color: #aaa; margin: 10px 0; min-height: 20px;
+}
+.btn-dub {
+  width: 100%; padding: 12px; background: #2d6a4f;
+  color: #fff; border: none; border-radius: 8px;
+  font-size: 1rem; cursor: pointer; font-weight: 600; margin-top: 8px;
+}
+.btn-dub:hover { background: #1b4332; }
+.btn-dub:disabled { background: #333; color: #666; cursor: not-allowed; }
+#dubVideoWrap { display: none; margin-top: 16px; }
+#dubVideoWrap video { width: 100%; border-radius: 8px; background: #000; }
+.btn-dl {
+  display: inline-block; margin-top: 10px; padding: 10px 20px;
+  background: #1d3557; color: #fff; border-radius: 8px;
+  text-decoration: none; font-size: 0.9rem; font-weight: 600;
+}
+.btn-dl:hover { background: #457b9d; }
 </style>
 </head>
 <body>
@@ -189,6 +222,50 @@ button#submitBtn:disabled { background: #333; color: #666; cursor: not-allowed; 
     </div>
     <div class="segments" id="segments"></div>
   </div>
+
+  <!-- Dubbing Card -->
+  <div class="card" id="dubCard" style="display:none">
+    <h2>🎙 Dubbing</h2>
+
+    <div style="background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:14px;margin-bottom:12px">
+      <label>Gemini API Keys <span style="font-size:12px;color:#666">(প্রতি লাইনে একটা)</span></label>
+      <textarea id="dubGeminiKeys" placeholder="AIza...&#10;AIza..." style="min-height:70px"></textarea>
+      <div class="row" style="margin-bottom:0">
+        <div>
+          <label>Voice</label>
+          <select id="dubVoice">
+            <option value="Schedar">Schedar</option>
+            <option value="Aoede">Aoede</option>
+            <option value="Algenib">Algenib</option>
+            <option value="Achernar">Achernar</option>
+            <option value="Gacrux">Gacrux</option>
+            <option value="Charon">Charon</option>
+            <option value="Kore">Kore</option>
+            <option value="Fenrir">Fenrir</option>
+          </select>
+        </div>
+        <div style="display:flex;align-items:flex-end">
+          <button class="btn-sm" onclick="dubSaveKeys()" style="width:100%">💾 Save</button>
+        </div>
+      </div>
+      <div id="dubKeysStatus" style="font-size:0.82rem;color:#4caf50;margin-top:4px"></div>
+    </div>
+
+    <p style="font-size:0.84rem;color:#888;margin-bottom:10px">
+      প্রতিটা segment এর Bengali/English translation নিচে লিখুন বা paste করুন:
+    </p>
+    <div id="dubSegments"></div>
+
+    <button class="btn-dub" id="dubBtn" onclick="startDubbing()">🎬 Generate Dubbed Video</button>
+    <div class="dub-progress" id="dubProgress"></div>
+
+    <div id="dubVideoWrap">
+      <video id="dubVideo" controls style="width:100%;border-radius:8px;background:#000;margin-top:12px"></video>
+      <br>
+      <a id="dubDownload" class="btn-dl" download="dubbed.mp4">⬇ Download Video</a>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -296,6 +373,11 @@ function startTranscribe() {
       div.querySelector('.txt').textContent = seg.text || '';
       segBox.appendChild(div);
     }
+
+    // Show dubbing card and populate segments
+    buildDubSegments(lastSegments);
+    document.getElementById('dubCard').style.display = 'block';
+    dubLoadKeys();
   });
 
   es.addEventListener('error', e => {
@@ -323,6 +405,165 @@ function copySRT() {
   });
   navigator.clipboard.writeText(srt.trim());
   alert('SRT copied!');
+}
+
+// ── Dubbing ──────────────────────────────────────────────────────────────────
+
+const DUB_KEYS_KEY = 'chinese_asr_gemini_keys';
+const DUB_VOICE_KEY = 'chinese_asr_gemini_voice';
+const DUB_GEMINI_MODEL = 'gemini-2.5-flash-preview-tts';
+const DUB_SAMPLE_RATE = 24000;
+
+function dubSaveKeys() {
+  const keys = document.getElementById('dubGeminiKeys').value.trim();
+  const voice = document.getElementById('dubVoice').value;
+  localStorage.setItem(DUB_KEYS_KEY, keys);
+  localStorage.setItem(DUB_VOICE_KEY, voice);
+  const count = keys.split('\n').filter(k => k.trim()).length;
+  document.getElementById('dubKeysStatus').textContent = `✅ ${count}টা key saved`;
+  setTimeout(() => document.getElementById('dubKeysStatus').textContent = '', 2000);
+}
+
+function dubLoadKeys() {
+  const saved = localStorage.getItem(DUB_KEYS_KEY);
+  if (saved) document.getElementById('dubGeminiKeys').value = saved;
+  const voice = localStorage.getItem(DUB_VOICE_KEY);
+  if (voice) document.getElementById('dubVoice').value = voice;
+}
+
+function buildDubSegments(segs) {
+  const box = document.getElementById('dubSegments');
+  box.innerHTML = '';
+  segs.forEach((seg, i) => {
+    const div = document.createElement('div');
+    div.className = 'dub-seg';
+    const dur = (seg.end - seg.start).toFixed(1);
+    div.innerHTML = `
+      <span class="ts">${fmtTime(seg.start)}<br>${fmtTime(seg.end)}<br><span style="color:#555;font-size:0.72rem">${dur}s</span></span>
+      <span class="orig"></span>
+      <textarea id="dub-txt-${i}" placeholder="Bengali/English translation..."></textarea>
+    `;
+    div.querySelector('.orig').textContent = seg.text || '';
+    box.appendChild(div);
+  });
+}
+
+async function dubCallGemini(text, voice, apiKey) {
+  const resp = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${DUB_GEMINI_MODEL}:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        contents: [{parts: [{text}]}],
+        generationConfig: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {voiceConfig: {prebuiltVoiceConfig: {voiceName: voice}}}
+        }
+      })
+    }
+  );
+  if (resp.status === 429) throw Object.assign(new Error('quota'), {code: 429});
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const data = await resp.json();
+  const b64 = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  if (!b64) throw new Error('No audio data');
+  // decode base64 PCM → ArrayBuffer
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr; // raw PCM s16le 24000hz mono
+}
+
+async function startDubbing() {
+  const keysRaw = document.getElementById('dubGeminiKeys').value.trim();
+  const voice   = document.getElementById('dubVoice').value;
+  const videoUrl = document.getElementById('urlInput').value.trim();
+  const progress = document.getElementById('dubProgress');
+  const btn      = document.getElementById('dubBtn');
+
+  if (!keysRaw) { alert('Gemini API keys দিন'); return; }
+  if (!videoUrl) { alert('Video URL নেই'); return; }
+  if (!lastSegments.length) { alert('আগে transcript করুন'); return; }
+
+  const keys = keysRaw.split('\n').map(k => k.trim()).filter(Boolean);
+  const segments = lastSegments.map((seg, i) => ({
+    start: seg.start,
+    end: seg.end,
+    text: (document.getElementById(`dub-txt-${i}`)?.value || '').trim()
+  })).filter(s => s.text);
+
+  if (!segments.length) { alert('কমপক্ষে একটা translation দিন'); return; }
+
+  btn.disabled = true;
+  document.getElementById('dubVideoWrap').style.display = 'none';
+
+  // Step 1: Generate TTS for each segment
+  progress.textContent = `⏳ TTS generating (0/${segments.length})...`;
+  let keyIdx = 0;
+  const audioSegments = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    progress.textContent = `⏳ TTS ${i+1}/${segments.length}: "${seg.text.substring(0,30)}..."`;
+    let done = false; let attempts = 0;
+    while (!done && attempts < keys.length) {
+      const key = keys[keyIdx % keys.length]; keyIdx++; attempts++;
+      try {
+        const pcm = await dubCallGemini(seg.text, voice, key);
+        audioSegments.push({ start: seg.start, end: seg.end, pcm });
+        done = true;
+      } catch(e) {
+        if (e.code === 429) {
+          await new Promise(r => setTimeout(r, 300));
+        } else {
+          progress.textContent = `❌ Segment ${i+1} error: ${e.message}`;
+          done = true;
+        }
+      }
+    }
+    await new Promise(r => setTimeout(r, 150));
+  }
+
+  progress.textContent = `✅ TTS done (${audioSegments.length}/${segments.length}). Sending to server...`;
+
+  // Step 2: Send to server for FFmpeg processing
+  try {
+    const payload = {
+      video_url: videoUrl,
+      segments: audioSegments.map(s => ({
+        start: s.start,
+        end: s.end,
+        pcm_b64: btoa(String.fromCharCode(...s.pcm)),
+        sample_rate: DUB_SAMPLE_RATE
+      }))
+    };
+
+    const resp = await fetch('/dub', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.error || `HTTP ${resp.status}`);
+    }
+
+    const result = await resp.json();
+    progress.textContent = '✅ Done! Video ready.';
+
+    const videoEl = document.getElementById('dubVideo');
+    const dlLink  = document.getElementById('dubDownload');
+    videoEl.src = result.video_url;
+    dlLink.href = result.video_url;
+    document.getElementById('dubVideoWrap').style.display = 'block';
+    videoEl.load();
+  } catch(e) {
+    progress.textContent = '❌ Error: ' + e.message;
+  }
+
+  btn.disabled = false;
 }
 </script>
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447" integrity="sha512-57MDmcccJXYtNnH+ZiBwzC4jb2rvgVCEokYN+L/nLlmO8rfYT/gIpW2A569iJ/3b+0UEasghjuZH/ma3wIs/EQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
