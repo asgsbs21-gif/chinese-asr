@@ -476,18 +476,20 @@ def synthesize():
         fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
         os.close(fd)
 
-        # edge-tts CLI — asyncio.run() এর বদলে subprocess (Flask threaded safe)
-        result = subprocess.run([
-            "edge-tts",
-            "--voice", voice,
-            "--pitch", pitch,
-            "--rate", rate,
-            "--text", text,
-            "--write-media", mp3_path,
-        ], capture_output=True, text=True, timeout=60)
+        # edge-tts Python API — subprocess CLI বাদ, thread-safe
+        async def _synth():
+            comm = edge_tts.Communicate(text, voice, pitch=pitch, rate=rate)
+            await comm.save(mp3_path)
 
-        if result.returncode != 0:
-            raise ValueError(f"edge-tts failed: {result.stderr[-200:]}")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_synth())
+        finally:
+            loop.close()
+
+        if not os.path.exists(mp3_path) or os.path.getsize(mp3_path) < 100:
+            raise ValueError("edge-tts: empty output, check voice/text")
 
         fd, wav_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
@@ -509,9 +511,6 @@ def synthesize():
         for p in (mp3_path, wav_path):
             if p and os.path.exists(p):
                 try:
-                    os.unlink(p)
-                except Exception:
-                    pass
                     os.unlink(p)
                 except Exception:
                     pass
