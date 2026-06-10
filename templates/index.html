@@ -213,7 +213,6 @@ button#submitBtn:disabled { background: #333; color: #666; cursor: not-allowed; 
     <label style="margin-top:4px">Groq API Keys <span style="font-size:12px;color:#666">(Translation এর জন্য — Gemini এর বিকল্প)</span></label>
     <textarea id="dubGroqKeys" placeholder="gsk_xxx&#10;gsk_yyy" style="min-height:60px"></textarea>
 
-    <!-- Gemini Voice + Fallback Pitch / Speed -->
     <div class="row" style="margin-bottom:0">
       <div>
         <label>Voice (Gemini)</label>
@@ -444,7 +443,6 @@ function startTranscribe() {
       segBox.appendChild(div);
     }
 
-    // Show dubbing card and populate segments
     buildDubSegments(lastSegments);
     document.getElementById('dubCard').style.display = 'block';
     dubLoadKeys();
@@ -483,7 +481,7 @@ const DUB_KEYS_KEY = 'chinese_asr_gemini_keys';
 const DUB_GROQ_KEYS_KEY = 'chinese_asr_groq_translate_keys';
 const DUB_VOICE_KEY = 'chinese_asr_gemini_voice';
 const DUB_PROVIDER_KEY = 'chinese_asr_translate_provider';
-const DUB_GEMINI_MODEL = 'gemini-2.0-flash';   // ✅ সঠিক মডেল
+const DUB_GEMINI_MODEL = 'gemini-2.0-flash';
 const DUB_SAMPLE_RATE = 24000;
 
 function dubSaveKeys() {
@@ -527,7 +525,6 @@ function dubSwitchTab(tab) {
   document.getElementById('tabManualBtn').className = 'tab-btn' + (tab === 'manual' ? ' tab-active' : '');
 }
 
-// Safe base64 encode for large Uint8Array (avoids call stack overflow)
 function uint8ToBase64(arr) {
   let binary = '';
   const chunkSize = 8192;
@@ -726,7 +723,7 @@ async function dubCallGemini(text, voice, apiKey) {
   const bin = atob(b64);
   const arr = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr; // raw PCM s16le 24000hz mono
+  return arr;
 }
 
 async function dubCallServerTTS(text, voice = 'bn-IN-TanishaaNeural', pitch = '-5%', rate = '+12%') {
@@ -755,18 +752,18 @@ async function getTTSSegment(text, geminiVoice, geminiKeys) {
     keyIdx++;
     try {
       const pcm = await dubCallGemini(text, geminiVoice, key);
-      return pcm;  // সফল হলে ফিরিয়ে দাও
+      return pcm;
     } catch(e) {
       if (e.code === 429) {
         const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
         await new Promise(r => setTimeout(r, delay));
       } else {
-        break; // অন্য error – Gemini দিয়ে হবে না, edge-tts এ যাও
+        break;
       }
     }
   }
 
-  // Gemini কাজ করেনি → fallback edge-tts
+  // Gemini কাজ করেনি → fallback edge‑tts
   const pitch = document.getElementById('fallbackPitch').value;
   const speed = document.getElementById('fallbackSpeed').value;
   return await dubCallServerTTS(text, 'bn-IN-TanishaaNeural', pitch, speed);
@@ -805,7 +802,6 @@ async function startDubbing() {
       progress.textContent = `❌ Segment ${i+1} error: ${e.message}`;
     }
 
-    // ছোট বিরতি যাতে UI হ্যাং না করে
     await new Promise(r => setTimeout(r, 50));
   }
 
@@ -817,7 +813,6 @@ async function startDubbing() {
 
   progress.textContent = `✅ TTS done (${audioSegments.length}/${segments.length}). Sending to server...`;
 
-  // Step 2: Send to server for FFmpeg processing
   try {
     const payload = {
       video_url: videoUrl,
