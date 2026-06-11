@@ -14,8 +14,10 @@ import httpx
 import edge_tts
 from flask import Flask, request, jsonify, render_template, Response, stream_with_context, send_from_directory
 from tts_job_routes import register_tts_routes
-register_tts_routes(app)
+
 app = Flask(__name__)
+
+register_tts_routes(app)  # ← app তৈরির পরে
 
 TEMP_DIR = os.environ.get("TEMP_DIR", "/tmp/asr")
 KS_API = os.environ.get("KS_API", "http://localhost:5557")
