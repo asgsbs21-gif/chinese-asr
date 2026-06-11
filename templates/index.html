@@ -14,6 +14,14 @@ body {
   padding: 24px 16px;
 }
 .container { max-width: 760px; margin: 0 auto; }
+.top-tabs { display: flex; gap: 0; border-bottom: 2px solid #2a2a2a; margin-bottom: 20px; }
+.top-tab {
+  padding: 10px 22px; background: none; border: none;
+  color: #777; font-size: 0.92rem; cursor: pointer; border-bottom: 2px solid transparent;
+  margin-bottom: -2px; font-weight: 500;
+}
+.top-tab:hover { color: #ccc; }
+.top-tab.active { color: #fff; border-bottom-color: #e63946; }
 h1 { font-size: 1.6rem; color: #fff; margin-bottom: 4px; }
 .sub { font-size: 0.9rem; color: #7b7b7b; margin-bottom: 24px; }
 .card {
@@ -183,6 +191,14 @@ button#submitBtn:disabled { background: #333; color: #666; cursor: not-allowed; 
   <h1>🎬 Chinese ASR</h1>
   <p class="sub">Kuaishou video → transcript with segment timestamps</p>
 
+  <div class="top-tabs">
+    <button class="top-tab active" onclick="switchTopTab('main')">🎬 Main</button>
+    <button class="top-tab" onclick="switchTopTab('setup')">⚙️ Setup</button>
+  </div>
+
+  <!-- ══ MAIN TAB ══ -->
+  <div id="topMain">
+
   <div class="card">
     <h2>⚙ Settings</h2>
     <label>Groq API Keys</label>
@@ -289,7 +305,6 @@ button#submitBtn:disabled { background: #333; color: #666; cursor: not-allowed; 
     <div style="display:flex;gap:8px;margin-bottom:14px">
       <button id="tabAutoBtn" class="tab-btn tab-active" onclick="dubSwitchTab('auto')">🤖 Auto Translate</button>
       <button id="tabManualBtn" class="tab-btn" onclick="dubSwitchTab('manual')">✍️ Manual SRT</button>
-      <button id="tabSetupBtn" class="tab-btn" onclick="dubSwitchTab('setup')">⚙️ Setup</button>
     </div>
 
     <!-- Auto Translate Tab -->
@@ -326,46 +341,8 @@ button#submitBtn:disabled { background: #333; color: #666; cursor: not-allowed; 
       <button class="btn-sm" onclick="dubParseSrt()" style="margin-bottom:12px">🔍 Parse SRT</button>
     </div>
 
-    <!-- Setup Tab -->
-    <div id="tabSetup" style="display:none">
-      <div style="display:flex;flex-direction:column;gap:16px;padding:4px 0">
 
-        <!-- Proxy / VMess -->
-        <div style="background:#1a2a1a;border-radius:8px;padding:14px">
-          <div style="font-weight:600;margin-bottom:10px">🔒 Proxy / VMess</div>
-          <label style="font-size:0.82rem;color:#aaa">VMess / VLess / SOCKS5 link</label>
-          <input id="setupVmess" type="text" placeholder="vmess://... or vless://... or socks5://..."
-            style="width:100%;margin:6px 0;font-size:0.8rem">
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn-sm" onclick="setupSaveProxy()">💾 Save & Start</button>
-            <button class="btn-sm" onclick="setupTestProxy()">🧪 Test Proxy</button>
-            <button class="btn-sm" style="background:#7f1d1d" onclick="setupClearProxy()">🗑 Clear</button>
-          </div>
-          <div id="setupProxyStatus" style="font-size:0.8rem;margin-top:8px;color:#4caf50"></div>
-        </div>
 
-        <!-- Cookies -->
-        <div style="background:#1a2a1a;border-radius:8px;padding:14px">
-          <div style="font-weight:600;margin-bottom:10px">🍪 YouTube Cookies</div>
-          <label style="font-size:0.82rem;color:#aaa">cookies.txt (Netscape format)</label>
-          <textarea id="setupCookies" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com ..."
-            style="min-height:100px;font-size:0.78rem;margin:6px 0"></textarea>
-          <div style="display:flex;gap:8px">
-            <button class="btn-sm" onclick="setupSaveCookies()">💾 Save Cookies</button>
-            <button class="btn-sm" style="background:#7f1d1d" onclick="setupDeleteCookies()">🗑 Delete</button>
-          </div>
-          <div id="setupCookieStatus" style="font-size:0.8rem;margin-top:8px;color:#4caf50"></div>
-        </div>
-
-        <!-- Status -->
-        <div style="background:#1a2a1a;border-radius:8px;padding:14px">
-          <div style="font-weight:600;margin-bottom:10px">📊 Status</div>
-          <button class="btn-sm" onclick="setupLoadStatus()">🔄 Refresh</button>
-          <pre id="setupStatusBox" style="font-size:0.78rem;color:#ccc;margin-top:8px;white-space:pre-wrap"></pre>
-        </div>
-
-      </div>
-    </div>
 
 
     <div id="dubParseStatus" style="font-size:0.82rem;color:#4caf50;margin-bottom:8px"></div>
@@ -379,7 +356,40 @@ button#submitBtn:disabled { background: #333; color: #666; cursor: not-allowed; 
       <br>
       <a id="dubDownload" class="btn-dl" download="dubbed.mp4">⬇ Download Video</a>
     </div>
-  </div>
+  </div><!-- /dubCard -->
+  </div><!-- /topMain -->
+
+  <!-- ══ SETUP TAB ══ -->
+  <div id="topSetup" style="display:none">
+    <div class="card">
+      <h2>🔒 Proxy / VMess</h2>
+      <label>VMess / VLess / SOCKS5 link</label>
+      <input id="setupVmess" type="text" placeholder="vmess://... or vless://... or socks5://...">
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn-sm" onclick="setupSaveProxy()">💾 Save & Start</button>
+        <button class="btn-sm" onclick="setupTestProxy()">🧪 Test Proxy</button>
+        <button class="btn-sm" style="background:#7f1d1d" onclick="setupClearProxy()">🗑 Clear</button>
+      </div>
+      <div id="setupProxyStatus" style="font-size:0.8rem;margin-top:8px;color:#4caf50"></div>
+    </div>
+
+    <div class="card">
+      <h2>🍪 YouTube Cookies</h2>
+      <label>cookies.txt (Netscape format)</label>
+      <textarea id="setupCookies" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com ..." style="min-height:120px;font-size:0.82rem"></textarea>
+      <div style="display:flex;gap:8px">
+        <button class="btn-sm" onclick="setupSaveCookies()">💾 Save Cookies</button>
+        <button class="btn-sm" style="background:#7f1d1d" onclick="setupDeleteCookies()">🗑 Delete</button>
+      </div>
+      <div id="setupCookieStatus" style="font-size:0.8rem;margin-top:8px;color:#4caf50"></div>
+    </div>
+
+    <div class="card">
+      <h2>📊 Status</h2>
+      <button class="btn-sm" onclick="setupLoadStatus()">🔄 Refresh</button>
+      <pre id="setupStatusBox" style="font-size:0.78rem;color:#ccc;margin-top:8px;white-space:pre-wrap"></pre>
+    </div>
+  </div><!-- /topSetup -->
 
 </div>
 
@@ -574,14 +584,20 @@ function buildDubSegments(segs) {
 
 let dubParsedSegments = [];
 
+function switchTopTab(tab) {
+  document.getElementById('topMain').style.display  = tab === 'main'  ? '' : 'none';
+  document.getElementById('topSetup').style.display = tab === 'setup' ? '' : 'none';
+  document.querySelectorAll('.top-tab').forEach((b, i) => {
+    b.classList.toggle('active', (tab === 'main' && i === 0) || (tab === 'setup' && i === 1));
+  });
+  if (tab === 'setup') setupLoadStatus();
+}
+
 function dubSwitchTab(tab) {
   document.getElementById('tabAuto').style.display   = tab === 'auto'   ? '' : 'none';
   document.getElementById('tabManual').style.display = tab === 'manual' ? '' : 'none';
-  document.getElementById('tabSetup').style.display  = tab === 'setup'  ? '' : 'none';
   document.getElementById('tabAutoBtn').className   = 'tab-btn' + (tab === 'auto'   ? ' tab-active' : '');
   document.getElementById('tabManualBtn').className = 'tab-btn' + (tab === 'manual' ? ' tab-active' : '');
-  document.getElementById('tabSetupBtn').className  = 'tab-btn' + (tab === 'setup'  ? ' tab-active' : '');
-  if (tab === 'setup') setupLoadStatus();
 }
 
 // ── Setup functions ──────────────────────────────────────────────
