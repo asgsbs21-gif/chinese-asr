@@ -36,64 +36,217 @@ def get_platform(url: str) -> str:
 
 
 # ─── yt-dlp download (YouTube / TikTok / Instagram) ──────────────
-def ytdlp_download(url: str, out_dir: str, job_log_fn=None) -> str:
-    """Download via yt-dlp, return path to downloaded mp4."""
-    platform = get_platform(url)
-    is_yt = platform == 'youtube'
+# ─── Xray / proxy management ─────────────────────────────────────
+import threading, signal
 
-    fmt = 'b[height<=720][ext=mp4]/bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
-    out_tpl = os.path.join(out_dir, 'dl_%(id)s.%(ext)s')
+XRAY_BIN    = os.environ.get("XRAY_BIN", "/usr/local/bin/xray")
+XRAY_CONFIG = os.environ.get("XRAY_CONFIG", "/app/data/xray-config.json")
+SOCKS_PORT  = int(os.environ.get("XRAY_SOCKS_PORT", "10808"))
+LOCAL_PROXY = f"socks5://127.0.0.1:{SOCKS_PORT}"
+CONFIG_FILE = os.environ.get("CONFIG_FILE", "/app/data/config.json")
 
+_xray_proc = None
+_xray_lock = threading.Lock()
+
+def load_config():
+    try:
+        if os.path.exists(CONFIG_FILE):
+            return json.loads(open(CONFIG_FILE).read())
+    except Exception:
+        pass
+    return {}
+
+def save_config(obj):
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    open(CONFIG_FILE, "w").write(json.dumps(obj, indent=2))
+
+def _decode_vmess(link):
+    import base64 as b64m
+    raw = b64m.b64decode(link.replace("vmess://","").strip() + "==").decode()
+    j = json.loads(raw)
+    return dict(type="vmess", address=j["add"], port=int(j["port"]), uuid=j["id"],
+                alterId=int(j.get("aid",0)), network=j.get("net","tcp"),
+                security="tls" if j.get("tls")=="tls" else "none",
+                host=j.get("host",j["add"]), path=j.get("path","/"),
+                sni=j.get("sni",j.get("host",j["add"])))
+
+def _decode_vless(link):
+    import urllib.parse as up
+    m = re.match(r"vless://([^@]+)@([^:/?]+):(\d+)(\?[^#]*)?", link, re.I)
+    if not m: raise ValueError("bad vless link")
+    uuid,host,port,qs = m.groups()
+    p = dict(up.parse_qsl((qs or "").lstrip("?")))
+    return dict(type="vless", address=host, port=int(port), uuid=uuid,
+                network=p.get("type","tcp"), security=p.get("security","none"),
+                host=p.get("host",host), path=p.get("path","/"),
+                sni=p.get("sni",host), flow=p.get("flow",""))
+
+def _build_xray_cfg(d):
+    if d["type"] == "vmess":
+        outbound = {"tag":"proxy","protocol":"vmess",
+            "settings":{"vnext":[{"address":d["address"],"port":d["port"],
+                "users":[{"id":d["uuid"],"alterId":d.get("alterId",0),"security":"auto"}]}]},
+            "streamSettings":_stream(d)}
+    elif d["type"] == "vless":
+        outbound = {"tag":"proxy","protocol":"vless",
+            "settings":{"vnext":[{"address":d["address"],"port":d["port"],
+                "users":[{"id":d["uuid"],"encryption":"none","flow":d.get("flow","")}]}]},
+            "streamSettings":_stream(d)}
+    else:
+        raise ValueError(f"unsupported type: {d['type']}")
+    return {"log":{"loglevel":"warning"},
+        "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":SOCKS_PORT,
+            "protocol":"socks","settings":{"auth":"noauth","udp":True}}],
+        "outbounds":[outbound,{"tag":"direct","protocol":"freedom","settings":{}}]}
+
+def _stream(d):
+    ss = {"network": d.get("network","tcp")}
+    if d.get("security") == "tls":
+        ss["security"] = "tls"
+        ss["tlsSettings"] = {"serverName": d.get("sni") or d.get("host") or d["address"]}
+    if d.get("network") == "ws":
+        ss["wsSettings"] = {"path": d.get("path","/"), "headers":{"Host": d.get("host","")}}
+    return ss
+
+def start_xray(link=None):
+    global _xray_proc
+    link = link or os.environ.get("VMESS_LINK","") or os.environ.get("PROXY_LINK","")
+    if not link: return False
+    link = link.strip()
+    if re.match(r"socks5?://", link, re.I):
+        os.environ["YTDLP_PROXY"] = link
+        print(f"[xray] passthrough socks5: {link}", flush=True)
+        return True
+    try:
+        if re.match(r"vmess://", link, re.I): d = _decode_vmess(link)
+        elif re.match(r"vless://", link, re.I): d = _decode_vless(link)
+        else: raise ValueError("unsupported scheme")
+        cfg = _build_xray_cfg(d)
+        os.makedirs(os.path.dirname(XRAY_CONFIG), exist_ok=True)
+        open(XRAY_CONFIG,"w").write(json.dumps(cfg, indent=2))
+        with _xray_lock:
+            stop_xray()
+            _xray_proc = subprocess.Popen([XRAY_BIN,"run","-c",XRAY_CONFIG],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        os.environ["YTDLP_PROXY"] = LOCAL_PROXY
+        print(f"[xray] started {d['type']} → {d['address']}:{d['port']} → {LOCAL_PROXY}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[xray] start failed: {e}", flush=True)
+        return False
+
+def stop_xray():
+    global _xray_proc
+    if _xray_proc:
+        try: _xray_proc.kill()
+        except Exception: pass
+        _xray_proc = None
+
+# startup — load saved config
+def _apply_saved_config():
+    cfg = load_config()
+    for k,v in cfg.items():
+        os.environ[k] = v
+    link = cfg.get("VMESS_LINK","") or cfg.get("PROXY_LINK","")
+    if link:
+        start_xray(link)
+
+_apply_saved_config()
+
+# ─── YT strategies ────────────────────────────────────────────────
+YT_STRATEGIES = [
+    {"name": "web_embedded", "client": "web_embedded", "max_sec": 150},
+    {"name": "mweb",         "client": "mweb",         "max_sec": 300},
+    {"name": "ios",          "client": "ios",           "max_sec": 120},
+    {"name": "android",      "client": "android",       "max_sec": 120},
+    {"name": "web_safari",   "client": "web_safari",    "max_sec": 150},
+    {"name": "tv_simply",    "client": "tv_simply",     "max_sec": 60},
+]
+
+def _build_ytdlp_base(is_yt=False, log_fn=None):
     args = [
-        'yt-dlp', '--no-warnings', '--newline', '--no-playlist',
-        '--retries', '5', '--fragment-retries', '5', '--retry-sleep', '2',
-        '--socket-timeout', '60',
-        '--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-        '--add-header', 'Accept-Language:en-US,en;q=0.9',
-        '-f', fmt, '--merge-output-format', 'mp4',
-        '-o', out_tpl, url,
+        "--no-warnings", "--progress", "--newline", "--no-playlist",
+        "--retries", "10", "--fragment-retries", "10", "--retry-sleep", "3",
+        "--socket-timeout", "60",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "--add-header", "Accept-Language:en-US,en;q=0.9",
+        "--geo-bypass",
+        "--hls-prefer-native", "--concurrent-fragments", "4", "-N", "4", "--http-chunk-size", "10M",
     ]
-
-    # YouTube only — proxy + cookies + deno
+    proxy = os.environ.get("YTDLP_PROXY","").strip()
+    cookies = os.environ.get("COOKIES_FILE", COOKIES_FILE)
     if is_yt:
-        if YTDLP_PROXY:
-            args += ['--proxy', YTDLP_PROXY]
-        if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 100:
-            args += ['--cookies', COOKIES_FILE]
+        # deno
         try:
-            subprocess.run(['deno', '--version'], capture_output=True, check=True)
-            args += ['--extractor-args', 'youtube:jsruntime=deno']
+            subprocess.run(["deno","--version"], capture_output=True, check=True)
+            args += ["--extractor-args","youtube:jsruntime=deno"]
+        except Exception:
+            pass
+        # cookies
+        if os.path.exists(cookies) and os.path.getsize(cookies) > 100:
+            args += ["--cookies", cookies]
+        # proxy — YouTube only
+        if proxy:
+            args += ["--proxy", proxy]
+            if log_fn: log_fn(f"✓ proxy: {proxy} (youtube only)")
+    return args
+
+def ytdlp_download(url: str, out_dir: str, job_log_fn=None) -> str:
+    """Multi-strategy yt-dlp download. YouTube gets proxy+cookies+deno+7 strategies."""
+    platform = get_platform(url)
+    is_yt    = platform == "youtube"
+    fmt      = "b[height<=720][ext=mp4][protocol*=https]/bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"
+    out_tpl  = os.path.join(out_dir, "dl_%(id)s.%(ext)s")
+
+    strategies = YT_STRATEGIES if is_yt else [{"name":"direct","client":None,"max_sec":180}]
+    errors = []
+
+    for strat in strategies:
+        # clean old partials
+        try:
+            for f in os.listdir(out_dir):
+                if f.startswith("dl_"): os.unlink(os.path.join(out_dir, f))
         except Exception:
             pass
 
-    if platform == 'tiktok':
-        args += ['--extractor-args', 'tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com']
+        args = ["yt-dlp"] + _build_ytdlp_base(is_yt, job_log_fn)
+        if is_yt and strat.get("client"):
+            args += ["--extractor-args", f"youtube:player_client={strat['client']}"]
+        if platform == "tiktok":
+            args += ["--extractor-args", "tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com"]
+        args += ["-f", fmt, "--merge-output-format", "mp4", "-o", out_tpl, url]
 
-    if job_log_fn:
-        job_log_fn(f"▶ yt-dlp [{platform}] starting...")
+        if job_log_fn: job_log_fn(f"━━ [{strat['name']}] {platform} ━━")
 
-    result = subprocess.run(args, capture_output=True, text=True, timeout=300)
-    if job_log_fn and result.stdout:
-        for line in result.stdout.strip().split('\n'):
-            if line: job_log_fn(f"yt-dlp> {line}")
+        try:
+            result = subprocess.run(args, capture_output=True, text=True,
+                                    timeout=strat.get("max_sec",180))
+            if job_log_fn and result.stdout:
+                for line in result.stdout.strip().split("\n"):
+                    if line: job_log_fn(f"yt-dlp> {line}")
+        except subprocess.TimeoutExpired:
+            errors.append(f"[{strat['name']}] timeout")
+            continue
+        except Exception as e:
+            errors.append(f"[{strat['name']}] {e}")
+            continue
 
-    # pick largest mp4
-    pick, pick_size = None, 0
-    for f in os.listdir(out_dir):
-        if not f.startswith('dl_') or f.endswith('.part'): continue
-        sz = os.path.getsize(os.path.join(out_dir, f))
-        if sz > pick_size:
-            pick_size = sz
-            pick = f
+        # pick largest file
+        pick, pick_size = None, 0
+        for f in os.listdir(out_dir):
+            if not f.startswith("dl_") or f.endswith(".part"): continue
+            sz = os.path.getsize(os.path.join(out_dir, f))
+            if sz > pick_size: pick_size = sz; pick = f
 
-    if not pick or pick_size < 50 * 1024:
-        raise ValueError(f"yt-dlp: no usable mp4 (exit {result.returncode})\n{result.stderr[-300:]}")
+        if pick and pick_size > 50 * 1024:
+            final = os.path.join(out_dir, "downloaded.mp4")
+            os.rename(os.path.join(out_dir, pick), final)
+            if job_log_fn: job_log_fn(f"✅ [{strat['name']}] OK ({pick_size/1024/1024:.1f} MB)")
+            return final
 
-    final = os.path.join(out_dir, 'downloaded.mp4')
-    os.rename(os.path.join(out_dir, pick), final)
-    if job_log_fn:
-        job_log_fn(f"✅ yt-dlp OK ({pick_size/1024/1024:.1f} MB)")
-    return final
+        errors.append(f"[{strat['name']}] no output (exit {getattr(result,'returncode','?')})")
+
+    raise ValueError(f"All strategies failed:\n" + "\n".join(errors))
 
 
 
@@ -707,6 +860,97 @@ def serve_dub_video(job_id, filename):
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
+
+
+# ─────────────────────── Setup / Config routes ────────────────────
+ALLOWED_CONFIG_KEYS = {
+    "VMESS_LINK","YTDLP_PROXY","COOKIES_FILE",
+    "GROQ_API_KEY","KS_COOKIES","KS_PROXY",
+}
+
+@app.route("/setup/status")
+def setup_status():
+    cookies = os.environ.get("COOKIES_FILE", COOKIES_FILE)
+    cookie_exists = os.path.exists(cookies) and os.path.getsize(cookies) > 100
+    return jsonify({
+        "cookies":  {"exists": cookie_exists, "size": os.path.getsize(cookies) if cookie_exists else 0},
+        "proxy":    {"configured": bool(os.environ.get("YTDLP_PROXY")),
+                     "url": os.environ.get("YTDLP_PROXY","")},
+        "vmess":    {"set": bool(os.environ.get("VMESS_LINK"))},
+        "xray_bin": os.path.exists(XRAY_BIN),
+    })
+
+@app.route("/setup/config", methods=["GET"])
+def setup_config_get():
+    cfg = load_config()
+    # mask sensitive
+    if "VMESS_LINK" in cfg: cfg["VMESS_LINK"] = cfg["VMESS_LINK"][:20] + "…"
+    return jsonify(cfg)
+
+@app.route("/setup/config", methods=["POST"])
+def setup_config_post():
+    incoming = request.get_json(force=True) or {}
+    current  = load_config()
+    xray_changed = False
+    for k, v in incoming.items():
+        if k not in ALLOWED_CONFIG_KEYS: continue
+        if not v:
+            current.pop(k, None)
+            os.environ.pop(k, None)
+        else:
+            current[k] = v.strip()
+            os.environ[k]  = v.strip()
+        if k in ("VMESS_LINK","YTDLP_PROXY"):
+            xray_changed = True
+    save_config(current)
+    if xray_changed:
+        link = current.get("VMESS_LINK","") or current.get("YTDLP_PROXY","")
+        if link: start_xray(link)
+        else: stop_xray()
+    return jsonify({"ok": True})
+
+@app.route("/setup/cookies", methods=["POST"])
+def setup_cookies():
+    data = request.get_json(force=True) or {}
+    content = data.get("cookies","").strip()
+    if not content:
+        return jsonify({"error": "cookies required"}), 400
+    cookies_path = os.environ.get("COOKIES_FILE", COOKIES_FILE)
+    os.makedirs(os.path.dirname(cookies_path), exist_ok=True)
+    if not content.startswith("# Netscape"):
+        content = "# Netscape HTTP Cookie File\n" + content
+    open(cookies_path,"w").write(content)
+    return jsonify({"ok": True, "size": len(content)})
+
+@app.route("/setup/cookies", methods=["DELETE"])
+def setup_cookies_delete():
+    cookies_path = os.environ.get("COOKIES_FILE", COOKIES_FILE)
+    try: os.unlink(cookies_path)
+    except Exception: pass
+    return jsonify({"ok": True})
+
+@app.route("/setup/proxy-test", methods=["POST"])
+def setup_proxy_test():
+    proxy = os.environ.get("YTDLP_PROXY","")
+    if not proxy:
+        return jsonify({"ok": False, "error": "No proxy configured"})
+    try:
+        r = subprocess.run(
+            ["curl","-x",proxy,"-s","--max-time","15",
+             "-o","/dev/null","-w","%{http_code}","https://api.ipify.org"],
+            capture_output=True, text=True, timeout=20)
+        ok = r.returncode == 0 and r.stdout.strip().startswith("2")
+        ip = None
+        if ok:
+            r2 = subprocess.run(
+                ["curl","-x",proxy,"-s","--max-time","10","https://api.ipify.org"],
+                capture_output=True, text=True, timeout=15)
+            ip = r2.stdout.strip()
+        return jsonify({"ok": ok, "ip": ip, "proxy": proxy})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 
 
 if __name__ == "__main__":
