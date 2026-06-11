@@ -6,12 +6,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libsndfile1 \
   && rm -rf /var/lib/apt/lists/*
 
-# ─── Python deps ──────────────────────────────────────────────────
+# ─── Python deps (spleeter বাদ) ──────────────────────────────────
 RUN pip install --no-cache-dir \
   flask httpx[socks] edge-tts \
   aiofiles aiosqlite lxml pyyaml rich uvicorn fastapi emoji \
   "yt-dlp[default]" instaloader \
-  spleeter \
   && yt-dlp --version \
   && instaloader --version
 
@@ -30,8 +29,8 @@ RUN ARCH=$(dpkg --print-architecture) \
   && rm -rf /tmp/xray.zip /tmp/xray \
   && xray version || true
 
-# ─── Spleeter model pre-download ──────────────────────────────────
-RUN python -c "from spleeter.separator import Separator; Separator('spleeter:2stems')" || true
+# ─── Spleeter model pre-download (REMOVED) ───────────────────────
+# (spleeter নেই, এটা দরকার হবে না)
 
 # ─── App ──────────────────────────────────────────────────────────
 WORKDIR /app
