@@ -1,7 +1,7 @@
-# 🎬 KwaiDub AI — Emotional Video Dubbing Toolkit
+# 🎬 KwaiDub AI —  Video Dubbing Toolkit
 
 **Download → Transcribe → Translate → Dub (Single-Person Voice, Emotion Mimic)**  
-🔥 *Paste any video link. Get a dubbed version in Bengali/English — with the ORIGINAL speaker's emotion!*
+🔥 *Paste any video link(YouTube,Facebook,titok,Instagram,kuaishou . Get a dubbed version in Bengali/English(any language) with Gemini api and Edge tts fallback.
 
 [![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](https://www.docker.com/)
