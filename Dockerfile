@@ -3,6 +3,7 @@ FROM python:3.12-slim
 # ─── System deps ──────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
   ffmpeg curl wget unzip ca-certificates git \
+  libsndfile1 soundfile \
   && rm -rf /var/lib/apt/lists/*
 
 # ─── Python deps ──────────────────────────────────────────────────
@@ -10,6 +11,7 @@ RUN pip install --no-cache-dir \
   flask httpx[socks] edge-tts \
   aiofiles aiosqlite lxml pyyaml rich uvicorn fastapi emoji \
   "yt-dlp[default]" instaloader \
+  spleeter \
   && yt-dlp --version \
   && instaloader --version
 
@@ -27,6 +29,9 @@ RUN ARCH=$(dpkg --print-architecture) \
   && chmod +x /usr/local/bin/xray \
   && rm -rf /tmp/xray.zip /tmp/xray \
   && xray version || true
+
+# ─── Spleeter model pre-download ──────────────────────────────────
+RUN python -c "from spleeter.separator import Separator; Separator('spleeter:2stems')" || true
 
 # ─── App ──────────────────────────────────────────────────────────
 WORKDIR /app
