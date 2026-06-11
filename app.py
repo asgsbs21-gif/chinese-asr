@@ -11,7 +11,7 @@ import base64
 from pathlib import Path
 
 import httpx
-import edge_tts  # নিশ্চিত থাকতে হবে যেন ইন্সটল করা আছে
+import edge_tts
 from flask import Flask, request, jsonify, render_template, Response, stream_with_context, send_from_directory
 
 app = Flask(__name__)
@@ -35,7 +35,6 @@ def get_platform(url: str) -> str:
     return 'unknown'
 
 
-# ─── yt-dlp download (YouTube / TikTok / Instagram) ──────────────
 # ─── Xray / proxy management ─────────────────────────────────────
 import threading, signal
 
@@ -142,7 +141,6 @@ def stop_xray():
         except Exception: pass
         _xray_proc = None
 
-# startup — load saved config
 def _apply_saved_config():
     cfg = load_config()
     for k,v in cfg.items():
@@ -176,23 +174,19 @@ def _build_ytdlp_base(is_yt=False, log_fn=None):
     proxy = os.environ.get("YTDLP_PROXY","").strip()
     cookies = os.environ.get("COOKIES_FILE", COOKIES_FILE)
     if is_yt:
-        # deno
         try:
             subprocess.run(["deno","--version"], capture_output=True, check=True)
             args += ["--extractor-args","youtube:jsruntime=deno"]
         except Exception:
             pass
-        # cookies
         if os.path.exists(cookies) and os.path.getsize(cookies) > 100:
             args += ["--cookies", cookies]
-        # proxy — YouTube only
         if proxy:
             args += ["--proxy", proxy]
             if log_fn: log_fn(f"✓ proxy: {proxy} (youtube only)")
     return args
 
 def ytdlp_download(url: str, out_dir: str, job_log_fn=None) -> str:
-    """Multi-strategy yt-dlp download. YouTube gets proxy+cookies+deno+7 strategies."""
     platform = get_platform(url)
     is_yt    = platform == "youtube"
     fmt      = "b[height<=720][ext=mp4][protocol*=https]/bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"
@@ -202,7 +196,6 @@ def ytdlp_download(url: str, out_dir: str, job_log_fn=None) -> str:
     errors = []
 
     for strat in strategies:
-        # clean old partials
         try:
             for f in os.listdir(out_dir):
                 if f.startswith("dl_"): os.unlink(os.path.join(out_dir, f))
@@ -231,7 +224,6 @@ def ytdlp_download(url: str, out_dir: str, job_log_fn=None) -> str:
             errors.append(f"[{strat['name']}] {e}")
             continue
 
-        # pick largest file
         pick, pick_size = None, 0
         for f in os.listdir(out_dir):
             if not f.startswith("dl_") or f.endswith(".part"): continue
@@ -247,7 +239,6 @@ def ytdlp_download(url: str, out_dir: str, job_log_fn=None) -> str:
         errors.append(f"[{strat['name']}] no output (exit {getattr(result,'returncode','?')})")
 
     raise ValueError(f"All strategies failed:\n" + "\n".join(errors))
-
 
 
 PHOTO_ID_RE = re.compile(r"/(?:short-video|video|photo)/([A-Za-z0-9_-]+)")
@@ -300,7 +291,6 @@ async def resolve_ks_url(url: str) -> str:
         async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as client:
             resp = await client.get(url)
             final_url = str(resp.url)
-            # Kuaishou geo-block / login wall detect
             from urllib.parse import urlparse
             path = urlparse(final_url).path
             if any(path.startswith(p) for p in BLOCKED_KS_PATHS):
@@ -428,23 +418,9 @@ async def download_video(video_url: str, out_path: str):
 
 def extract_audio(video_path: str, mp3_path: str):
     subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            video_path,
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-b:a",
-            "128k",
-            "-vn",
-            mp3_path,
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        ["ffmpeg", "-y", "-i", video_path,
+         "-ar", "16000", "-ac", "1", "-b:a", "128k", "-vn", mp3_path],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
 
@@ -470,8 +446,7 @@ async def groq_transcribe(mp3_path: str, groq_keys: list[str], language: str = "
             async with httpx.AsyncClient(timeout=180) as client:
                 with open(mp3_path, "rb") as f:
                     resp = await client.post(
-                        url,
-                        headers=headers,
+                        url, headers=headers,
                         files={"file": ("audio.mp3", f, "audio/mpeg")},
                         data=data,
                     )
@@ -501,7 +476,6 @@ def has_chinese(text: str) -> bool:
 
 
 def split_long_segments(segments: list, max_dur: float = 8.0) -> list:
-    """Split segments longer than max_dur into equal time chunks."""
     result = []
     for seg in segments:
         start = seg["start"]
@@ -530,10 +504,10 @@ def split_long_segments(segments: list, max_dur: float = 8.0) -> list:
 
 def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
     job_id = f"asr_{int(time.time())}"
-    work_dir  = os.path.join(TEMP_DIR, job_id)
+    work_dir   = os.path.join(TEMP_DIR, job_id)
     video_path = os.path.join(TEMP_DIR, f"{job_id}.mp4")
-    mp3_path = os.path.join(TEMP_DIR, f"{job_id}.mp3")
-    groq_keys = parse_groq_keys(groq_keys_raw)
+    mp3_path   = os.path.join(TEMP_DIR, f"{job_id}.mp3")
+    groq_keys  = parse_groq_keys(groq_keys_raw)
     Path(work_dir).mkdir(parents=True, exist_ok=True)
 
     try:
@@ -551,7 +525,7 @@ def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
             asyncio.run(download_video(video_url, video_path))
         else:
             yield sse("log", {"msg": f"⬇ Downloading via yt-dlp ({platform})..."})
-            def log_fn(msg): pass  # SSE এর ভেতরে yield করা যায় না, তাই silent
+            def log_fn(msg): pass
             video_path = ytdlp_download(url, work_dir, log_fn)
 
         size_mb = os.path.getsize(video_path) / 1024 / 1024
@@ -565,7 +539,6 @@ def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
         result = asyncio.run(groq_transcribe(mp3_path, groq_keys, language))
         yield sse("log", {"msg": f"✅ Transcription done! ({result.get('duration', 0):.1f}s audio)"})
 
-        # ✅ ডিফল্ট সেগমেন্ট ব্যবহার
         segments = []
         raw_segments = result.get("segments")
         if raw_segments:
@@ -576,7 +549,6 @@ def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
                     "text": (seg.get("text") or "").strip(),
                 })
         else:
-            # fallback
             words = result.get("words", [])
             current_words = []
             current_start = None
@@ -609,6 +581,7 @@ def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
         yield sse(
             "done",
             {
+                "job_id": job_id,  # 🔥 emotion mimic এর জন্য
                 "text": result.get("text", ""),
                 "segments": segments,
                 "duration": result.get("duration", 0),
@@ -620,21 +593,19 @@ def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
     except Exception as e:
         yield sse("error", {"msg": str(e)})
     finally:
-        for p in [video_path, mp3_path]:
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
+        # video delete করা হচ্ছে, mp3 রাখা হচ্ছে dubbing এর জন্য
+        try:
+            os.unlink(video_path)
+        except Exception:
+            pass
 
 
-# ──────────────────────── edge‑tts নির্ভরযোগ্য ফিক্স ────────────────────────
+# ──────────────────────── /synthesize ────────────────────────────────────────
 @app.route("/synthesize", methods=["POST"])
 def synthesize():
     data = request.get_json(force=True)
-    text  = data.get("text", "").strip()
-    voice = data.get("voice", "bn-IN-TanishaaNeural")
-    pitch = data.get("pitch", "-5Hz")
-    rate  = data.get("rate", "+12%")
+    text     = data.get("text", "").strip()
+    provider = data.get("provider", "edge-tts")  # "gemini_audio" or "edge-tts"
 
     if not text:
         return jsonify({"error": "text required"}), 400
@@ -645,28 +616,126 @@ def synthesize():
         fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
         os.close(fd)
 
-        # edge-tts Python API — subprocess CLI বাদ, thread-safe
-        async def _synth():
-            comm = edge_tts.Communicate(text, voice, pitch=pitch, rate=rate)
-            await comm.save(mp3_path)
+        # ── 🔥 Gemini Emotion Mimic (Multimodal) ──────────────────────────────
+        if provider == "gemini_audio":
+            gemini_key = data.get("gemini_key", "").strip()
+            job_id     = data.get("job_id", "").strip()
+            start      = float(data.get("start", 0))
+            end        = float(data.get("end", 0))
+            voice_name       = data.get("voice", "Gacrux")
+            target_language  = data.get("target_language", "").strip()  # e.g. "Bengali", "English"
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(_synth())
-        finally:
-            loop.close()
+            if not gemini_key:
+                raise ValueError("gemini_key required for emotion mimic")
 
+            orig_audio_path = os.path.join(TEMP_DIR, f"{job_id}.mp3")
+            if not os.path.exists(orig_audio_path):
+                raise ValueError("Original audio not found. Please Extract Transcript again.")
+
+            # অরিজিনাল অডিও থেকে নির্দিষ্ট segment কাটা
+            fd_chunk, chunk_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd_chunk)
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", orig_audio_path,
+                 "-ss", str(start), "-to", str(end),
+                 "-c", "copy", chunk_path],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+
+            with open(chunk_path, "rb") as f:
+                audio_bytes = f.read()
+            try:
+                os.unlink(chunk_path)
+            except Exception:
+                pass
+
+            # Generic multilingual prompt
+            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+            lang_hint = f" Speak in {target_language}." if target_language else ""
+            prompt = (
+                f"Listen to the emotion, tone, pace, and prosody of this audio clip carefully."
+                f" Now synthesize the following text preserving the exact same emotion, intensity, and energy.{lang_hint}"
+                f" Text: '{text}'"
+            )
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"inline_data": {"mime_type": "audio/mp3", "data": audio_b64}},
+                        {"text": prompt}
+                    ]
+                }],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {"voiceName": voice_name}
+                        }
+                    }
+                }
+            }
+
+            gemini_url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-2.0-flash:generateContent?key={gemini_key}"
+            )
+
+            async def _call_gemini():
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(gemini_url, json=payload)
+                    if resp.status_code == 429:
+                        raise ValueError("429")
+                    resp.raise_for_status()
+                    return resp.json()
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(_call_gemini())
+            finally:
+                loop.close()
+
+            b64_audio = (
+                result.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("inlineData", {})
+                .get("data")
+            )
+            if not b64_audio:
+                raise ValueError("Gemini returned no audio data")
+
+            audio_bin = base64.b64decode(b64_audio)
+            with open(mp3_path, "wb") as f:
+                f.write(audio_bin)
+
+        # ── Edge-TTS fallback ─────────────────────────────────────────────────
+        else:
+            voice = data.get("voice", "bn-IN-TanishaaNeural")
+            pitch = data.get("pitch", "-5Hz")
+            rate  = data.get("rate", "+12%")
+
+            async def _synth():
+                comm = edge_tts.Communicate(text, voice, pitch=pitch, rate=rate)
+                await comm.save(mp3_path)
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_synth())
+            finally:
+                loop.close()
+
+        # ── WAV convert → PCM base64 ──────────────────────────────────────────
         if not os.path.exists(mp3_path) or os.path.getsize(mp3_path) < 100:
-            raise ValueError("edge-tts: empty output, check voice/text")
+            raise ValueError("TTS returned empty output")
 
         fd, wav_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
-        subprocess.run([
-            "ffmpeg", "-y", "-i", mp3_path,
-            "-ar", "24000", "-ac", "1", "-sample_fmt", "s16",
-            wav_path
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", mp3_path,
+             "-ar", "24000", "-ac", "1", "-sample_fmt", "s16", wav_path],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
 
         with open(wav_path, "rb") as f:
             wav_bytes = f.read()
@@ -674,6 +743,7 @@ def synthesize():
         pcm_b64 = base64.b64encode(pcm_bytes).decode()
 
         return jsonify({"pcm_b64": pcm_b64, "sample_rate": 24000})
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -707,10 +777,7 @@ def transcribe():
     return Response(
         stream_with_context(transcribe_stream(url, groq_keys, language)),
         mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -755,10 +822,10 @@ def dub():
 
         seg_files = []
         for i, seg in enumerate(segments):
-            start    = float(seg["start"])
-            end      = float(seg["end"])
-            pcm_b64  = seg.get("pcm_b64", "")
-            sr       = int(seg.get("sample_rate", 24000))
+            start      = float(seg["start"])
+            end        = float(seg["end"])
+            pcm_b64    = seg.get("pcm_b64", "")
+            sr         = int(seg.get("sample_rate", 24000))
             target_dur = max(0.2, end - start)
 
             if not pcm_b64:
@@ -766,12 +833,12 @@ def dub():
 
             pcm_bytes = base64.b64decode(pcm_b64)
 
-            num_channels   = 1
+            num_channels    = 1
             bits_per_sample = 16
-            data_size      = len(pcm_bytes)
-            byte_rate      = sr * num_channels * (bits_per_sample // 8)
-            block_align    = num_channels * (bits_per_sample // 8)
-            chunk_size     = 36 + data_size
+            data_size       = len(pcm_bytes)
+            byte_rate       = sr * num_channels * (bits_per_sample // 8)
+            block_align     = num_channels * (bits_per_sample // 8)
+            chunk_size      = 36 + data_size
             header = struct.pack(
                 "<4sI4s4sIHHIIHH4sI",
                 b"RIFF", chunk_size, b"WAVE", b"fmt ", 16, 1,
@@ -783,8 +850,7 @@ def dub():
                 f.write(header + pcm_bytes)
 
             probe2 = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-print_format", "json",
-                 "-show_streams", raw_wav],
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", raw_wav],
                 capture_output=True, text=True
             )
             try:
@@ -807,10 +873,10 @@ def dub():
             af = ",".join(atempo_filters)
 
             fit_wav = os.path.join(job_dir, f"seg_{i}_fit.wav")
-            subprocess.run([
-                "ffmpeg", "-y", "-i", raw_wav,
-                "-af", af, fit_wav
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", raw_wav, "-af", af, fit_wav],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
 
             seg_files.append({"path": fit_wav, "start": start})
 
@@ -837,16 +903,13 @@ def dub():
 
         subprocess.run([
             "ffmpeg", "-y",
-            "-i", video_path,
-            "-i", mixed_audio,
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "128k",
+            "-i", video_path, "-i", mixed_audio,
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
             "-map", "0:v:0", "-map", "1:a:0",
             "-shortest", out_path
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        video_serve_url = f"/dub_video/{job_id}/dubbed.mp4"
-        return jsonify({"video_url": video_serve_url, "job_id": job_id})
+        return jsonify({"video_url": f"/dub_video/{job_id}/dubbed.mp4", "job_id": job_id})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -884,7 +947,6 @@ def setup_status():
 @app.route("/setup/config", methods=["GET"])
 def setup_config_get():
     cfg = load_config()
-    # mask sensitive
     if "VMESS_LINK" in cfg: cfg["VMESS_LINK"] = cfg["VMESS_LINK"][:20] + "…"
     return jsonify(cfg)
 
@@ -950,8 +1012,6 @@ def setup_proxy_test():
         return jsonify({"ok": ok, "ip": ip, "proxy": proxy})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
-
-
 
 
 if __name__ == "__main__":
