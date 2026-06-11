@@ -714,6 +714,30 @@ def transcribe():
     )
 
 
+def separate_bgm(video_path: str, job_dir: str) -> str:
+    """Spleeter দিয়ে BGM আলাদা করো, accompaniment.wav return করো"""
+    try:
+        from spleeter.separator import Separator
+        audio_path = os.path.join(job_dir, "audio_for_split.wav")
+        subprocess.run([
+            "ffmpeg", "-y", "-i", video_path,
+            "-ar", "44100", "-ac", "2", audio_path
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        separator = Separator('spleeter:2stems')
+        separator.separate_to_file(audio_path, job_dir)
+
+        # spleeter output folder নাম হয় audio file নাম থেকে
+        base = os.path.splitext(os.path.basename(audio_path))[0]
+        bgm_path = os.path.join(job_dir, base, "accompaniment.wav")
+
+        if os.path.exists(bgm_path):
+            return bgm_path
+    except Exception as e:
+        print(f"[spleeter] failed: {e}", flush=True)
+    return None
+
+
 @app.route("/dub", methods=["POST"])
 def dub():
     data = request.get_json(force=True)
@@ -835,10 +859,26 @@ def dub():
         else:
             mixed_audio = base_audio
 
+        # ✅ BGM separation এবং চূড়ান্ত অডিও মিক্স
+        bgm_path = separate_bgm(video_path, job_dir)
+
+        if bgm_path:
+            # BGM + Bengali voice merge
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", mixed_audio,
+                "-i", bgm_path,
+                "-filter_complex", "[0][1]amix=inputs=2:normalize=0[aout]",
+                "-map", "[aout]", os.path.join(job_dir, "final_audio.wav")
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            final_audio = os.path.join(job_dir, "final_audio.wav")
+        else:
+            final_audio = mixed_audio
+
         subprocess.run([
             "ffmpeg", "-y",
             "-i", video_path,
-            "-i", mixed_audio,
+            "-i", final_audio,
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "128k",
             "-map", "0:v:0", "-map", "1:a:0",
