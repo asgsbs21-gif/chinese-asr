@@ -675,9 +675,9 @@ def synthesize():
             }
 
             gemini_url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-2.0-flash:generateContent?key={gemini_key}"
-            )
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"gemini-2.5-flash-preview-tts:generateContent?key={gemini_key}"
+)
 
             async def _call_gemini():
                 async with httpx.AsyncClient(timeout=60) as client:
