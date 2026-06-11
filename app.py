@@ -479,7 +479,7 @@ def synthesize():
     data = request.get_json(force=True)
     text  = data.get("text", "").strip()
     voice = data.get("voice", "bn-IN-TanishaaNeural")
-    pitch = data.get("pitch", "-5%")
+    pitch = data.get("pitch", "-5Hz")
     rate  = data.get("rate", "+12%")
 
     if not text:
