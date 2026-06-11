@@ -3,7 +3,7 @@ FROM python:3.12-slim
 # ─── System deps ──────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
   ffmpeg curl wget unzip ca-certificates git \
-  libsndfile1 soundfile \
+  libsndfile1 \
   && rm -rf /var/lib/apt/lists/*
 
 # ─── Python deps ──────────────────────────────────────────────────
