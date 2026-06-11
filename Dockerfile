@@ -3,10 +3,9 @@ FROM python:3.12-slim
 # ─── System deps ──────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
   ffmpeg curl wget unzip ca-certificates git \
-  libsndfile1 \
   && rm -rf /var/lib/apt/lists/*
 
-# ─── Python deps (spleeter বাদ) ──────────────────────────────────
+# ─── Python deps ──────────────────────────────────────────────────
 RUN pip install --no-cache-dir \
   flask httpx[socks] edge-tts \
   aiofiles aiosqlite lxml pyyaml rich uvicorn fastapi emoji \
@@ -28,9 +27,6 @@ RUN ARCH=$(dpkg --print-architecture) \
   && chmod +x /usr/local/bin/xray \
   && rm -rf /tmp/xray.zip /tmp/xray \
   && xray version || true
-
-# ─── Spleeter model pre-download (REMOVED) ───────────────────────
-# (spleeter নেই, এটা দরকার হবে না)
 
 # ─── App ──────────────────────────────────────────────────────────
 WORKDIR /app
