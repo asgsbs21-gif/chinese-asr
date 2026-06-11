@@ -895,7 +895,7 @@ async function getTTSSegment(text, geminiVoice, geminiKeys, segIdx, total) {
   }
 
   // Gemini — সব key rotate করে চেষ্টা
-  const MAX_ROUNDS = 3;
+  const MAX_ROUNDS = 1;  // 3 থেকে 1
   const maxAttempts = geminiKeys.length * MAX_ROUNDS;
   let cooldown = 6000;
 
@@ -912,7 +912,7 @@ async function getTTSSegment(text, geminiVoice, geminiKeys, segIdx, total) {
         document.getElementById('dubProgress').textContent =
           `⏳ TTS ${segIdx+1}/${total}: key quota, trying next... (${attempt+1}/${maxAttempts})`;
         await new Promise(r => setTimeout(r, cooldown));
-        if ((attempt + 1) % geminiKeys.length === 0) cooldown = Math.min(cooldown * 1.5, 5000);
+        if ((attempt + 1) % geminiKeys.length === 0) cooldown = Math.min(cooldown * 1.5, 60000);  // 5000 থেকে 60000
       } else {
     continue;
 }
