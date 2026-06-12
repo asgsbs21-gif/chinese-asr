@@ -1,170 +1,1235 @@
-import os, json, subprocess, tempfile, asyncio, httpx, time
-from flask import Flask, request, jsonify, render_template, Response, stream_with_context
+import os
+import re
+import json
+import time
+import uuid
+import struct
+import asyncio
+import subprocess
+import tempfile
+import base64
+import threading
 from pathlib import Path
+
+import httpx
+import edge_tts
+from flask import Flask, request, jsonify, render_template, Response, stream_with_context, send_from_directory
 
 app = Flask(__name__)
 
-TEMP_DIR  = os.environ.get("TEMP_DIR", "/tmp/asr")
-KS_API    = "http://localhost:5557"
-KS_PROXY  = os.environ.get("KS_PROXY", "")
+TEMP_DIR = os.environ.get("TEMP_DIR", "/tmp/asr")
+KS_API = os.environ.get("KS_API", "http://localhost:5557")
+KS_PROXY  = os.environ.get("KS_PROXY", "").strip()
+KS_COOKIE = os.environ.get("KS_COOKIE", "").strip()
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "/app/data/cookies/cookies.txt")
+YTDLP_PROXY  = os.environ.get("YTDLP_PROXY", "").strip()
 
 Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
-# ── SSE helper ────────────────────────────────────────────────────
-def sse(event, data):
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+# ═══════════════════════════════════════════════════════════════════════════
+# TTS JOB SYSTEM  (zip প্রজেক্টের মতো — server-side, resume support)
+# ═══════════════════════════════════════════════════════════════════════════
 
-# ── KS-Downloader: video URL বের করো ─────────────────────────────
-async def get_ks_video_url(page_url: str) -> str:
+JOBS_DIR = os.path.join(TEMP_DIR, "tts_jobs")
+Path(JOBS_DIR).mkdir(parents=True, exist_ok=True)
+
+GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+GEMINI_TTS_URL   = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_TTS_MODEL}:generateContent?key={{key}}"
+)
+
+def _job_path(job_id: str) -> str:
+    return os.path.join(JOBS_DIR, f"{job_id}.json")
+
+def _seg_wav_path(job_id: str, idx: int) -> str:
+    return os.path.join(JOBS_DIR, f"{job_id}_seg{idx}.wav")
+
+def load_job(job_id: str):
+    p = _job_path(job_id)
+    if not os.path.exists(p):
+        return None
+    try:
+        return json.loads(open(p).read())
+    except Exception:
+        return None
+
+def save_job(job: dict):
+    open(_job_path(job["id"]), "w").write(json.dumps(job, ensure_ascii=False, indent=2))
+
+def _pcm_to_wav(pcm: bytes, sample_rate=24000) -> bytes:
+    num_channels    = 1
+    bits_per_sample = 16
+    data_size       = len(pcm)
+    byte_rate       = sample_rate * num_channels * (bits_per_sample // 8)
+    block_align     = num_channels * (bits_per_sample // 8)
+    chunk_size      = 36 + data_size
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", chunk_size, b"WAVE", b"fmt ", 16, 1,
+        num_channels, sample_rate, byte_rate, block_align, bits_per_sample,
+        b"data", data_size,
+    )
+    return header + pcm
+
+async def _gemini_tts_once(text: str, voice: str, api_key: str) -> bytes:
+    """Gemini TTS — raw PCM bytes ফেরত দেয়। 429 হলে raise করে।"""
     payload = {
-        "text":  page_url,
-        "proxy": KS_PROXY or "socks5://127.0.0.1:10808",
+        "contents": [{"parts": [{"text": text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": voice}
+                }
+            },
+        },
     }
-    for attempt in range(15):
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(GEMINI_TTS_URL.format(key=api_key), json=payload)
+        if resp.status_code == 429:
+            raise httpx.HTTPStatusError("429", request=resp.request, response=resp)
+        resp.raise_for_status()
+        data = resp.json()
+        b64 = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("inlineData", {})
+            .get("data")
+        )
+        if not b64:
+            raise ValueError("Gemini returned no audio data")
+        return base64.b64decode(b64)
+
+async def _edge_tts_once(text: str, voice="bn-IN-TanishaaNeural",
+                          pitch="-5Hz", rate="+12%") -> bytes:
+    """Edge-TTS fallback — raw PCM bytes ফেরত দেয়।"""
+    fd, mp3 = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
+    wav = None
+    try:
+        comm = edge_tts.Communicate(text, voice, pitch=pitch, rate=rate)
+        await comm.save(mp3)
+        fd2, wav = tempfile.mkstemp(suffix=".wav")
+        os.close(fd2)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", mp3,
+             "-ar", "24000", "-ac", "1", "-sample_fmt", "s16", wav],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        with open(wav, "rb") as f:
+            wav_bytes = f.read()
+        return wav_bytes[44:]  # raw PCM (header skip)
+    finally:
+        for p in [mp3, wav]:
+            if p and os.path.exists(p):
+                try: os.unlink(p)
+                except Exception: pass
+
+async def synthesize_one_segment(
+    text: str, voice: str, gemini_keys: list,
+    edge_pitch="-5Hz", edge_rate="+12%",
+    key_idx_ref: list = None,
+) -> tuple:
+    """
+    zip এর মতো key rotation:
+      - সব key একবার ঘুরায়
+      - সবাই 429 → 60s sleep → আবার (max 3 round)
+      - তারপর Edge-TTS fallback
+    Returns (pcm_bytes, provider_name)
+    """
+    if not gemini_keys:
+        pcm = await _edge_tts_once(text, pitch=edge_pitch, rate=edge_rate)
+        return pcm, "edge"
+
+    if key_idx_ref is None:
+        key_idx_ref = [0]
+
+    MAX_ROUNDS   = 3
+    cooldown_sec = 60
+
+    for round_num in range(MAX_ROUNDS):
+        for _ in range(len(gemini_keys)):
+            key = gemini_keys[key_idx_ref[0] % len(gemini_keys)]
+            key_idx_ref[0] += 1
+            try:
+                pcm = await _gemini_tts_once(text, voice, key)
+                return pcm, f"gemini(key#{(key_idx_ref[0]-1) % len(gemini_keys) + 1})"
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    continue  # next key
+                raise
+            except Exception:
+                raise
+
+        # পুরো একটা round শেষ — সব key 429
+        if round_num < MAX_ROUNDS - 1:
+            await asyncio.sleep(cooldown_sec)
+
+    # সব round শেষ → Edge fallback
+    pcm = await _edge_tts_once(text, pitch=edge_pitch, rate=edge_rate)
+    return pcm, "edge-fallback"
+
+def _run_tts_job(job_id: str):
+    """
+    Background thread এ চলে।
+    zip এর synthesize_speech_worker এর মতো:
+      - segment file আগে থেকে থাকলে skip (resume)
+      - নতুন হলে TTS করে file save
+      - job JSON update করে progress track করে
+    """
+    job = load_job(job_id)
+    if not job:
+        return
+
+    job["status"]     = "running"
+    job["started_at"] = time.time()
+    save_job(job)
+
+    segments = job["segments"]
+    keys     = job.get("gemini_keys", [])
+    voice    = job.get("voice", "Charon")
+    pitch    = job.get("edge_pitch", "-5Hz")
+    rate     = job.get("edge_rate", "+12%")
+    key_idx  = [job.get("_key_idx", 0)]
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        for i, seg in enumerate(segments):
+            wav_path = _seg_wav_path(job_id, i)
+
+            # Resume: file আগে থেকে আছে? skip
+            if os.path.exists(wav_path) and os.path.getsize(wav_path) > 100:
+                seg["status"]   = "done"
+                seg["wav_path"] = wav_path
+                job["done"]     = sum(1 for s in segments if s.get("status") == "done")
+                save_job(job)
+                continue
+
+            seg["status"]  = "processing"
+            job["current"] = i
+            save_job(job)
+
+            try:
+                pcm, provider = loop.run_until_complete(
+                    synthesize_one_segment(
+                        text        = seg["text"],
+                        voice       = voice,
+                        gemini_keys = keys,
+                        edge_pitch  = pitch,
+                        edge_rate   = rate,
+                        key_idx_ref = key_idx,
+                    )
+                )
+                wav_bytes = _pcm_to_wav(pcm)
+                with open(wav_path, "wb") as f:
+                    f.write(wav_bytes)
+
+                seg["status"]   = "done"
+                seg["wav_path"] = wav_path
+                seg["provider"] = provider
+
+            except Exception as e:
+                seg["status"] = "error"
+                seg["error"]  = str(e)
+
+            job["done"]     = sum(1 for s in segments if s.get("status") == "done")
+            job["_key_idx"] = key_idx[0]
+            save_job(job)
+
+        job["status"] = "complete"
+        save_job(job)
+
+    except Exception as e:
+        job["status"] = "error"
+        job["error"]  = str(e)
+        save_job(job)
+    finally:
+        loop.close()
+
+
+# ─── TTS Routes ───────────────────────────────────────────────────────────────
+
+@app.route("/tts/start", methods=["POST"])
+def tts_start():
+    data        = request.get_json(force=True)
+    segments    = data.get("segments", [])
+    gemini_keys = data.get("gemini_keys", [])
+    voice       = data.get("voice", "Charon")
+    edge_pitch  = data.get("edge_pitch", "-5Hz")
+    edge_rate   = data.get("edge_rate", "+12%")
+    resume_id   = data.get("resume_id", "").strip()
+
+    if not segments:
+        return jsonify({"error": "segments required"}), 400
+
+    # resume: পুরনো job চলছে বা pending?
+    if resume_id:
+        old_job = load_job(resume_id)
+        if old_job and old_job.get("status") not in ("complete", "error"):
+            return jsonify({"job_id": resume_id, "resumed": True})
+
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "id":          job_id,
+        "status":      "pending",
+        "created_at":  time.time(),
+        "gemini_keys": gemini_keys,
+        "voice":       voice,
+        "edge_pitch":  edge_pitch,
+        "edge_rate":   edge_rate,
+        "done":        0,
+        "total":       len(segments),
+        "current":     -1,
+        "_key_idx":    0,
+        "segments": [
+            {
+                "idx":    i,
+                "start":  s["start"],
+                "end":    s["end"],
+                "text":   s["text"],
+                "status": "pending",
+            }
+            for i, s in enumerate(segments)
+        ],
+    }
+    save_job(job)
+
+    t = threading.Thread(target=_run_tts_job, args=(job_id,), daemon=True)
+    t.start()
+
+    return jsonify({"job_id": job_id, "resumed": False})
+
+
+@app.route("/tts/status/<job_id>")
+def tts_status(job_id):
+    def generate():
+        last_done = -1
+        while True:
+            job = load_job(job_id)
+            if not job:
+                yield f"event: error\ndata: {json.dumps({'msg': 'job not found'})}\n\n"
+                return
+
+            done   = job.get("done", 0)
+            total  = job.get("total", 1)
+            curr   = job.get("current", -1)
+            status = job.get("status", "")
+
+            if done != last_done or status in ("complete", "error"):
+                seg_text = ""
+                if 0 <= curr < len(job["segments"]):
+                    seg_text = job["segments"][curr].get("text", "")[:30]
+
+                yield (
+                    f"event: progress\n"
+                    f"data: {json.dumps({'done': done, 'total': total, 'current': curr, 'seg_text': seg_text, 'status': status})}\n\n"
+                )
+                last_done = done
+
+            if status in ("complete", "error"):
+                results = []
+                for s in job["segments"]:
+                    wav_path = s.get("wav_path", "")
+                    if s.get("status") == "done" and wav_path and os.path.exists(wav_path):
+                        with open(wav_path, "rb") as f:
+                            wav_bytes = f.read()
+                        pcm_bytes = wav_bytes[44:]
+                        results.append({
+                            "idx":      s["idx"],
+                            "start":    s["start"],
+                            "end":      s["end"],
+                            "pcm_b64":  base64.b64encode(pcm_bytes).decode(),
+                            "provider": s.get("provider", "?"),
+                        })
+                    else:
+                        results.append({
+                            "idx":   s["idx"],
+                            "start": s["start"],
+                            "end":   s["end"],
+                            "error": s.get("error", "failed"),
+                        })
+
+                yield (
+                    f"event: done\n"
+                    f"data: {json.dumps({'results': results, 'status': status})}\n\n"
+                )
+                return
+
+            time.sleep(1.5)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.route("/tts/job/<job_id>")
+def tts_job_get(job_id):
+    job = load_job(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+    safe = {k: v for k, v in job.items() if k not in ("gemini_keys", "_key_idx")}
+    return jsonify(safe)
+
+
+@app.route("/tts/job/<job_id>", methods=["DELETE"])
+def tts_job_delete(job_id):
+    job = load_job(job_id)
+    if job:
+        for i in range(job.get("total", 0)):
+            p = _seg_wav_path(job_id, i)
+            try: os.unlink(p)
+            except Exception: pass
+    p = _job_path(job_id)
+    try: os.unlink(p)
+    except Exception: pass
+    return jsonify({"ok": True})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLATFORM / PROXY / XRAY
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_platform(url: str) -> str:
+    if re.search(r'instagram\.com', url, re.I):        return 'instagram'
+    if re.search(r'tiktok\.com|vm\.tiktok\.com', url, re.I): return 'tiktok'
+    if re.search(r'kuaishou\.com|v\.kuaishou\.com', url, re.I): return 'kuaishou'
+    if re.search(r'youtube\.com|youtu\.be', url, re.I): return 'youtube'
+    return 'unknown'
+
+XRAY_BIN    = os.environ.get("XRAY_BIN", "/usr/local/bin/xray")
+XRAY_CONFIG = os.environ.get("XRAY_CONFIG", "/app/data/xray-config.json")
+SOCKS_PORT  = int(os.environ.get("XRAY_SOCKS_PORT", "10808"))
+LOCAL_PROXY = f"socks5://127.0.0.1:{SOCKS_PORT}"
+CONFIG_FILE = os.environ.get("CONFIG_FILE", "/app/data/config.json")
+
+_xray_proc = None
+_xray_lock = threading.Lock()
+
+def load_config():
+    try:
+        if os.path.exists(CONFIG_FILE):
+            return json.loads(open(CONFIG_FILE).read())
+    except Exception:
+        pass
+    return {}
+
+def save_config(obj):
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    open(CONFIG_FILE, "w").write(json.dumps(obj, indent=2))
+
+def _decode_vmess(link):
+    import base64 as b64m
+    raw = b64m.b64decode(link.replace("vmess://","").strip() + "==").decode()
+    j = json.loads(raw)
+    return dict(type="vmess", address=j["add"], port=int(j["port"]), uuid=j["id"],
+                alterId=int(j.get("aid",0)), network=j.get("net","tcp"),
+                security="tls" if j.get("tls")=="tls" else "none",
+                host=j.get("host",j["add"]), path=j.get("path","/"),
+                sni=j.get("sni",j.get("host",j["add"])))
+
+def _decode_vless(link):
+    import urllib.parse as up
+    m = re.match(r"vless://([^@]+)@([^:/?]+):(\d+)(\?[^#]*)?", link, re.I)
+    if not m: raise ValueError("bad vless link")
+    uuid_,host,port,qs = m.groups()
+    p = dict(up.parse_qsl((qs or "").lstrip("?")))
+    return dict(type="vless", address=host, port=int(port), uuid=uuid_,
+                network=p.get("type","tcp"), security=p.get("security","none"),
+                host=p.get("host",host), path=p.get("path","/"),
+                sni=p.get("sni",host), flow=p.get("flow",""))
+
+def _build_xray_cfg(d):
+    if d["type"] == "vmess":
+        outbound = {"tag":"proxy","protocol":"vmess",
+            "settings":{"vnext":[{"address":d["address"],"port":d["port"],
+                "users":[{"id":d["uuid"],"alterId":d.get("alterId",0),"security":"auto"}]}]},
+            "streamSettings":_stream(d)}
+    elif d["type"] == "vless":
+        outbound = {"tag":"proxy","protocol":"vless",
+            "settings":{"vnext":[{"address":d["address"],"port":d["port"],
+                "users":[{"id":d["uuid"],"encryption":"none","flow":d.get("flow","")}]}]},
+            "streamSettings":_stream(d)}
+    else:
+        raise ValueError(f"unsupported type: {d['type']}")
+    return {"log":{"loglevel":"warning"},
+        "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":SOCKS_PORT,
+            "protocol":"socks","settings":{"auth":"noauth","udp":True}}],
+        "outbounds":[outbound,{"tag":"direct","protocol":"freedom","settings":{}}]}
+
+def _stream(d):
+    ss = {"network": d.get("network","tcp")}
+    if d.get("security") == "tls":
+        ss["security"] = "tls"
+        ss["tlsSettings"] = {"serverName": d.get("sni") or d.get("host") or d["address"]}
+    if d.get("network") == "ws":
+        ss["wsSettings"] = {"path": d.get("path","/"), "headers":{"Host": d.get("host","")}}
+    return ss
+
+def start_xray(link=None):
+    global _xray_proc
+    link = link or os.environ.get("VMESS_LINK","") or os.environ.get("PROXY_LINK","")
+    if not link: return False
+    link = link.strip()
+    if re.match(r"socks5?://", link, re.I):
+        os.environ["YTDLP_PROXY"] = link
+        return True
+    try:
+        if re.match(r"vmess://", link, re.I): d = _decode_vmess(link)
+        elif re.match(r"vless://", link, re.I): d = _decode_vless(link)
+        else: raise ValueError("unsupported scheme")
+        cfg = _build_xray_cfg(d)
+        os.makedirs(os.path.dirname(XRAY_CONFIG), exist_ok=True)
+        open(XRAY_CONFIG,"w").write(json.dumps(cfg, indent=2))
+        with _xray_lock:
+            stop_xray()
+            _xray_proc = subprocess.Popen([XRAY_BIN,"run","-c",XRAY_CONFIG],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        os.environ["YTDLP_PROXY"] = LOCAL_PROXY
+        return True
+    except Exception as e:
+        print(f"[xray] start failed: {e}", flush=True)
+        return False
+
+def stop_xray():
+    global _xray_proc
+    if _xray_proc:
+        try: _xray_proc.kill()
+        except Exception: pass
+        _xray_proc = None
+
+def _apply_saved_config():
+    cfg = load_config()
+    for k,v in cfg.items():
+        os.environ[k] = v
+    link = cfg.get("VMESS_LINK","") or cfg.get("PROXY_LINK","")
+    if link:
+        start_xray(link)
+
+_apply_saved_config()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# YT-DLP
+# ═══════════════════════════════════════════════════════════════════════════
+
+YT_STRATEGIES = [
+    {"name": "web_embedded", "client": "web_embedded", "max_sec": 150},
+    {"name": "mweb",         "client": "mweb",         "max_sec": 300},
+    {"name": "ios",          "client": "ios",           "max_sec": 120},
+    {"name": "android",      "client": "android",       "max_sec": 120},
+    {"name": "web_safari",   "client": "web_safari",    "max_sec": 150},
+    {"name": "tv_simply",    "client": "tv_simply",     "max_sec": 60},
+]
+
+def _build_ytdlp_base(is_yt=False, log_fn=None):
+    args = [
+        "--no-warnings", "--progress", "--newline", "--no-playlist",
+        "--retries", "10", "--fragment-retries", "10", "--retry-sleep", "3",
+        "--socket-timeout", "60",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "--add-header", "Accept-Language:en-US,en;q=0.9",
+        "--geo-bypass",
+        "--hls-prefer-native", "--concurrent-fragments", "4", "-N", "4", "--http-chunk-size", "10M",
+    ]
+    proxy   = os.environ.get("YTDLP_PROXY","").strip()
+    cookies = os.environ.get("COOKIES_FILE", COOKIES_FILE)
+    if is_yt:
+        try:
+            subprocess.run(["deno","--version"], capture_output=True, check=True)
+            args += ["--extractor-args","youtube:jsruntime=deno"]
+        except Exception:
+            pass
+        if os.path.exists(cookies) and os.path.getsize(cookies) > 100:
+            args += ["--cookies", cookies]
+        if proxy:
+            args += ["--proxy", proxy]
+    return args
+
+def ytdlp_download(url: str, out_dir: str, job_log_fn=None) -> str:
+    platform = get_platform(url)
+    is_yt    = platform == "youtube"
+    fmt      = "b[height<=720][ext=mp4][protocol*=https]/bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"
+    out_tpl  = os.path.join(out_dir, "dl_%(id)s.%(ext)s")
+    strategies = YT_STRATEGIES if is_yt else [{"name":"direct","client":None,"max_sec":180}]
+    errors = []
+
+    for strat in strategies:
+        try:
+            for f in os.listdir(out_dir):
+                if f.startswith("dl_"): os.unlink(os.path.join(out_dir, f))
+        except Exception:
+            pass
+
+        args = ["yt-dlp"] + _build_ytdlp_base(is_yt, job_log_fn)
+        if is_yt and strat.get("client"):
+            args += ["--extractor-args", f"youtube:player_client={strat['client']}"]
+        if platform == "tiktok":
+            args += ["--extractor-args", "tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com"]
+        args += ["-f", fmt, "--merge-output-format", "mp4", "-o", out_tpl, url]
+
+        if job_log_fn: job_log_fn(f"━━ [{strat['name']}] {platform} ━━")
+
+        try:
+            result = subprocess.run(args, capture_output=True, text=True,
+                                    timeout=strat.get("max_sec",180))
+            if job_log_fn and result.stdout:
+                for line in result.stdout.strip().split("\n"):
+                    if line: job_log_fn(f"yt-dlp> {line}")
+        except subprocess.TimeoutExpired:
+            errors.append(f"[{strat['name']}] timeout"); continue
+        except Exception as e:
+            errors.append(f"[{strat['name']}] {e}"); continue
+
+        pick, pick_size = None, 0
+        for f in os.listdir(out_dir):
+            if not f.startswith("dl_") or f.endswith(".part"): continue
+            sz = os.path.getsize(os.path.join(out_dir, f))
+            if sz > pick_size: pick_size = sz; pick = f
+
+        if pick and pick_size > 50 * 1024:
+            final = os.path.join(out_dir, "downloaded.mp4")
+            os.rename(os.path.join(out_dir, pick), final)
+            if job_log_fn: job_log_fn(f"✅ [{strat['name']}] OK ({pick_size/1024/1024:.1f} MB)")
+            return final
+
+        errors.append(f"[{strat['name']}] no output (exit {getattr(result,'returncode','?')})")
+
+    raise ValueError(f"All strategies failed:\n" + "\n".join(errors))
+
+# ═══════════════════════════════════════════════════════════════════════════
+# KUAISHOU
+# ═══════════════════════════════════════════════════════════════════════════
+
+PHOTO_ID_RE = re.compile(r"/(?:short-video|video|photo)/([A-Za-z0-9_-]+)")
+
+def extract_photo_id(url: str):
+    m = PHOTO_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+async def wait_for_ks_api(max_wait_ms: int = 10000) -> bool:
+    start = time.time()
+    while (time.time() - start) * 1000 < max_wait_ms:
+        try:
+            async with httpx.AsyncClient(timeout=2) as client:
+                resp = await client.get(f"{KS_API}/docs")
+                if resp.status_code == 200:
+                    return True
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+    return False
+
+BLOCKED_KS_PATHS = ("/new-reco", "/login", "/captcha", "/error", "/404")
+
+async def resolve_ks_url(url: str) -> str:
+    direct = extract_photo_id(url)
+    if direct:
+        return url
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Referer": "https://www.kuaishou.com/",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as client:
+            resp = await client.get(url)
+            final_url = str(resp.url)
+            from urllib.parse import urlparse
+            path = urlparse(final_url).path
+            if any(path.startswith(p) for p in BLOCKED_KS_PATHS):
+                raise ValueError(f"Kuaishou blocked (redirected to {path})")
+            return final_url
+    except ValueError:
+        raise
+    except Exception:
+        return url
+
+async def get_ks_video_url_via_api(raw_url: str):
+    payload = {"text": raw_url}
+    if KS_COOKIE: payload["cookie"] = KS_COOKIE
+    if KS_PROXY:  payload["proxy"]  = KS_PROXY
+    last_error = None
+    for attempt in range(4):
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(f"{KS_API}/detail/", json=payload)
                 resp.raise_for_status()
-                data = resp.json()
-            break
+                body = resp.json()
+            data = body.get("data")
+            if not data: raise ValueError(f"KS-API: {body.get('message','no data')}")
+            downloads = data.get("download", [])
+            if isinstance(downloads, str): downloads = downloads.split()
+            if not downloads: raise ValueError("KS-API: no download URL")
+            return downloads[0], data
         except Exception as e:
-            if attempt < 14:
-                await asyncio.sleep(2)
-                continue
-            raise ValueError(f"KS-API not available: {e}")
+            last_error = e
+            if attempt < 3: await asyncio.sleep(1.5)
+    raise ValueError(str(last_error or "KS-API failed"))
 
-    if not data.get("data"):
-        raise ValueError(f"KS-API: {data.get('message', 'no data')}")
+async def get_ks_video_url_via_graphql(raw_url: str):
+    resolved_url = await resolve_ks_url(raw_url)
+    photo_id = extract_photo_id(resolved_url)
+    if not photo_id:
+        raise ValueError(f"GraphQL: cannot extract photoId from {resolved_url}")
+    payload = {
+        "operationName": "visionVideoDetail",
+        "variables": {"photoId": photo_id, "page": "detail"},
+        "query": (
+            "query visionVideoDetail($photoId: String, $page: String) { "
+            "visionVideoDetail(photoId: $photoId, page: $page) { "
+            "photo { id caption photoUrl duration } } }"
+        ),
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": f"https://www.kuaishou.com/short-video/{photo_id}",
+        "Origin": "https://www.kuaishou.com",
+        "Accept": "*/*",
+    }
+    if KS_COOKIE: headers["Cookie"] = KS_COOKIE
 
-    downloads = data["data"].get("download", [])
-    if isinstance(downloads, str):
-        downloads = downloads.split()
-    if not downloads:
-        raise ValueError("No download URL in KS response")
-    return downloads[0]
+    async def _try(proxy=None):
+        kw = {"timeout": 45}
+        if proxy: kw["proxy"] = proxy
+        async with httpx.AsyncClient(**kw) as client:
+            resp = await client.post("https://www.kuaishou.com/graphql", headers=headers, json=payload)
+            resp.raise_for_status()
+            body = resp.json()
+            video_url = body.get("data",{}).get("visionVideoDetail",{}).get("photo",{}).get("photoUrl")
+            if not video_url:
+                err = body.get("errors",[{}])[0].get("message","no photoUrl")
+                raise ValueError(f"GraphQL: {err}")
+            photo = body.get("data",{}).get("visionVideoDetail",{}).get("photo",{})
+            return video_url, {"photoId": photo.get("id") or photo_id,
+                               "caption": photo.get("caption") or photo_id,
+                               "duration": photo.get("duration") or 0,
+                               "resolved_url": resolved_url}
 
-    if not data.get("data"):
-        raise ValueError(f"KS-API: {data.get('message', 'no data')}")
+    try:
+        return await _try(None)
+    except Exception:
+        if KS_PROXY: return await _try(KS_PROXY)
+        raise
 
-    downloads = data["data"].get("download", [])
-    if isinstance(downloads, str):
-        downloads = downloads.split()
-    if not downloads:
-        raise ValueError("No download URL in KS response")
-    return downloads[0]
+async def get_ks_video_url(raw_url: str):
+    api_ready = await wait_for_ks_api(12000)
+    if api_ready:
+        try:
+            video_url, meta = await get_ks_video_url_via_api(raw_url)
+            return video_url, meta, "ks-downloader-api"
+        except Exception:
+            pass
+    video_url, meta = await get_ks_video_url_via_graphql(raw_url)
+    return video_url, meta, "graphql-fallback"
 
-# ── Video download ────────────────────────────────────────────────
 async def download_video(video_url: str, out_path: str):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": "https://www.kuaishou.com/",
     }
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
         async with client.stream("GET", video_url, headers=headers) as resp:
             resp.raise_for_status()
             with open(out_path, "wb") as f:
-                async for chunk in resp.aiter_bytes(8192):
+                async for chunk in resp.aiter_bytes(1024 * 64):
                     f.write(chunk)
 
-# ── FFmpeg: audio extract ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# ASR HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
 def extract_audio(video_path: str, mp3_path: str):
-    subprocess.run([
-        "ffmpeg", "-y", "-i", video_path,
-        "-ar", "16000", "-ac", "1", "-b:a", "128k",
-        "-vn", mp3_path
-    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path,
+         "-ar", "16000", "-ac", "1", "-b:a", "128k", "-vn", mp3_path],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
 
-# ── Groq Whisper: transcribe ──────────────────────────────────────
-async def groq_transcribe(mp3_path: str, groq_key: str) -> dict:
+async def groq_transcribe(mp3_path: str, groq_keys: list, language: str = "zh") -> dict:
+    if not groq_keys:
+        raise ValueError("No Groq API key provided")
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {groq_key}"}
-    async with httpx.AsyncClient(timeout=120) as client:
-        with open(mp3_path, "rb") as f:
-            resp = await client.post(url, headers=headers, files={
-                "file": ("audio.mp3", f, "audio/mpeg"),
-            }, data={
-                "model": "whisper-large-v3",
-                "language": "zh",
-                "response_format": "verbose_json",
-                "timestamp_granularities[]": "segment",
-            })
-        resp.raise_for_status()
-        return resp.json()
+    retryable_statuses = {402, 420, 429}
+    last_error = None
+    for idx, groq_key in enumerate(groq_keys, start=1):
+        headers = {"Authorization": f"Bearer {groq_key}"}
+        data = {
+            "model": "whisper-large-v3",
+            "response_format": "verbose_json",
+            "timestamp_granularities[]": ["segment", "word"],
+        }
+        if language and language != "auto":
+            data["language"] = language
+        try:
+            async with httpx.AsyncClient(timeout=180) as client:
+                with open(mp3_path, "rb") as f:
+                    resp = await client.post(url, headers=headers,
+                                             files={"file": ("audio.mp3", f, "audio/mpeg")},
+                                             data=data)
+            if resp.status_code in retryable_statuses:
+                last_error = ValueError(f"Groq key {idx} quota/rate-limited ({resp.status_code})")
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in retryable_statuses or (status is not None and status >= 500):
+                last_error = ValueError(f"Groq key {idx} failed with status {status}")
+                continue
+            raise
+        except Exception as e:
+            last_error = e
+            if idx < len(groq_keys): continue
+            raise
+    raise ValueError(str(last_error or "All Groq keys failed"))
 
-# ── Main SSE pipeline ─────────────────────────────────────────────
-def transcribe_stream(url: str, groq_key: str):
-    job_id    = f"asr_{int(time.time())}"
+def has_chinese(text: str) -> bool:
+    return any('\u4e00' <= c <= '\u9fff' for c in text)
+
+def split_long_segments(segments: list, max_dur: float = 8.0) -> list:
+    result = []
+    for seg in segments:
+        start = seg["start"]; end = seg["end"]; text = seg["text"]
+        dur = end - start
+        if dur <= max_dur:
+            result.append(seg); continue
+        n = max(2, int(dur / max_dur) + 1)
+        words = text.split()
+        time_step  = dur / n
+        chunk_size = max(1, len(words) // n)
+        for i in range(n):
+            t_start = start + i * time_step
+            t_end   = start + (i+1) * time_step if i < n-1 else end
+            chunk_words = words[i*chunk_size:(i+1)*chunk_size] if i < n-1 else words[i*chunk_size:]
+            chunk_text  = " ".join(chunk_words).strip()
+            if chunk_text:
+                result.append({"start": round(t_start,3), "end": round(t_end,3), "text": chunk_text})
+    return result
+
+def parse_groq_keys(raw: str) -> list:
+    keys = []
+    for part in re.split(r"[\n,]+", raw or ""):
+        part = part.strip()
+        if part and part not in keys:
+            keys.append(part)
+    return keys
+
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+def transcribe_stream(url: str, groq_keys_raw: str, language: str = "zh"):
+    job_id   = f"asr_{int(time.time())}"
+    work_dir = os.path.join(TEMP_DIR, job_id)
     video_path = os.path.join(TEMP_DIR, f"{job_id}.mp4")
     mp3_path   = os.path.join(TEMP_DIR, f"{job_id}.mp3")
+    groq_keys  = parse_groq_keys(groq_keys_raw)
+    Path(work_dir).mkdir(parents=True, exist_ok=True)
 
     try:
-        yield sse("log", {"msg": "⏳ Getting video URL from KS-Downloader..."})
-        video_url = asyncio.run(get_ks_video_url(url))
-        yield sse("log", {"msg": "✅ Video URL found"})
+        platform = get_platform(url)
+        strategy = "yt-dlp"
+        yield sse("log", {"msg": f"🔍 Platform: {platform.upper()}"})
 
-        yield sse("log", {"msg": "⬇ Downloading video..."})
-        asyncio.run(download_video(video_url, video_path))
+        if platform == 'kuaishou':
+            yield sse("log", {"msg": "⏳ Getting Kuaishou video URL..."})
+            video_url, meta, strategy = asyncio.run(get_ks_video_url(url))
+            caption = (meta or {}).get("caption") or (meta or {}).get("photoId") or "Kuaishou"
+            yield sse("log", {"msg": f"✅ Video URL found via {strategy}"})
+            yield sse("log", {"msg": f"🎬 Source: {caption}"})
+            yield sse("log", {"msg": "⬇ Downloading video..."})
+            asyncio.run(download_video(video_url, video_path))
+        else:
+            yield sse("log", {"msg": f"⬇ Downloading via yt-dlp ({platform})..."})
+            video_path = ytdlp_download(url, work_dir)
+
         size_mb = os.path.getsize(video_path) / 1024 / 1024
         yield sse("log", {"msg": f"✅ Downloaded ({size_mb:.1f} MB)"})
-
         yield sse("log", {"msg": "🔊 Extracting audio (ffmpeg)..."})
         extract_audio(video_path, mp3_path)
         yield sse("log", {"msg": "✅ Audio extracted"})
+        yield sse("log", {"msg": f"🤖 Sending to Groq Whisper ({language})..."})
+        result = asyncio.run(groq_transcribe(mp3_path, groq_keys, language))
+        yield sse("log", {"msg": f"✅ Transcription done! ({result.get('duration',0):.1f}s audio)"})
 
-        yield sse("log", {"msg": "🤖 Sending to Groq Whisper..."})
-        result = asyncio.run(groq_transcribe(mp3_path, groq_key))
-        yield sse("log", {"msg": f"✅ Transcription done! ({result.get('duration', 0):.1f}s audio)"})
-
-        # Format segments
         segments = []
-        for seg in result.get("segments", []):
-            segments.append({
-                "start": seg["start"],
-                "end":   seg["end"],
-                "text":  seg["text"].strip(),
-            })
+        raw_segments = result.get("segments")
+        if raw_segments:
+            for seg in raw_segments:
+                segments.append({
+                    "start": seg.get("start", 0),
+                    "end":   seg.get("end", 0),
+                    "text":  (seg.get("text") or "").strip(),
+                })
+        else:
+            words = result.get("words", [])
+            current_words = []; current_start = None
+            for w in words:
+                word_text = w.get("word","").strip()
+                if not word_text: continue
+                if current_start is None: current_start = w["start"]
+                current_words.append(word_text)
+                if word_text[-1] in '।.?!\n':
+                    joined = "".join(current_words) if has_chinese(word_text) else " ".join(current_words)
+                    segments.append({"start": round(current_start,3), "end": round(w["end"],3), "text": joined})
+                    current_words = []; current_start = None
+            if current_words:
+                joined = "".join(current_words) if has_chinese(words[-1]["word"]) else " ".join(current_words)
+                segments.append({"start": round(current_start,3), "end": round(words[-1]["end"],3), "text": joined})
 
+        segments = split_long_segments(segments, max_dur=8.0)
         yield sse("done", {
-            "text":     result.get("text", ""),
+            "job_id":   job_id,
+            "text":     result.get("text",""),
             "segments": segments,
-            "duration": result.get("duration", 0),
+            "duration": result.get("duration",0),
+            "strategy": strategy,
+            "language": language,
         })
 
     except Exception as e:
         yield sse("error", {"msg": str(e)})
-
     finally:
-        for p in [video_path, mp3_path]:
-            try: os.unlink(p)
-            except: pass
+        try: os.unlink(video_path)
+        except Exception: pass
 
-# ── Routes ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# FLASK ROUTES
+# ═══════════════════════════════════════════════════════════════════════════
+
 @app.route("/")
 def index():
     return render_template("index.html")
 
 @app.route("/transcribe")
 def transcribe():
-    url      = request.args.get("url", "").strip()
-    groq_key = request.args.get("groq_key", "").strip()
-
-    if not url:
-        return jsonify({"error": "url required"}), 400
-    if not groq_key:
-        return jsonify({"error": "groq_key required"}), 400
-
+    url       = request.args.get("url","").strip()
+    groq_keys = request.args.get("groq_keys","").strip() or request.args.get("groq_key","").strip()
+    language  = request.args.get("language","zh").strip() or "zh"
+    if not url:       return jsonify({"error": "url required"}), 400
+    if not groq_keys: return jsonify({"error": "groq_keys required"}), 400
     return Response(
-        stream_with_context(transcribe_stream(url, groq_key)),
+        stream_with_context(transcribe_stream(url, groq_keys, language)),
         mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+@app.route("/synthesize", methods=["POST"])
+def synthesize():
+    data     = request.get_json(force=True)
+    text     = data.get("text","").strip()
+    provider = data.get("provider","edge-tts")
+    if not text:
+        return jsonify({"error": "text required"}), 400
+
+    mp3_path = None
+    wav_path = None
+    try:
+        fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+
+        if provider == "gemini_audio":
+            gemini_key      = data.get("gemini_key","").strip()
+            job_id          = data.get("job_id","").strip()
+            start           = float(data.get("start",0))
+            end             = float(data.get("end",0))
+            voice_name      = data.get("voice","Gacrux")
+            target_language = data.get("target_language","").strip()
+
+            if not gemini_key:
+                raise ValueError("gemini_key required for emotion mimic")
+
+            orig_audio_path = os.path.join(TEMP_DIR, f"{job_id}.mp3")
+            if not os.path.exists(orig_audio_path):
+                raise ValueError("Original audio not found. Please Extract Transcript again.")
+
+            fd_chunk, chunk_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd_chunk)
+            subprocess.run(
+                ["ffmpeg","-y","-i",orig_audio_path,"-ss",str(start),"-to",str(end),"-c","copy",chunk_path],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            with open(chunk_path,"rb") as f: audio_bytes = f.read()
+            try: os.unlink(chunk_path)
+            except Exception: pass
+
+            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+            lang_hint = f" Speak in {target_language}." if target_language else ""
+            prompt = (
+                f"Listen to the emotion, tone, pace, and prosody of this audio clip carefully."
+                f" Now synthesize the following text preserving the exact same emotion, intensity, and energy.{lang_hint}"
+                f" Text: '{text}'"
+            )
+            payload = {
+                "contents": [{"parts": [
+                    {"inline_data": {"mime_type": "audio/mp3", "data": audio_b64}},
+                    {"text": prompt}
+                ]}],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice_name}}}
+                }
+            }
+            gemini_url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-2.0-flash:generateContent?key={gemini_key}"
+            )
+            async def _call_gemini():
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(gemini_url, json=payload)
+                    if resp.status_code == 429: raise ValueError("429")
+                    resp.raise_for_status()
+                    return resp.json()
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:    result = loop.run_until_complete(_call_gemini())
+            finally: loop.close()
+
+            b64_audio = (
+                result.get("candidates",[{}])[0]
+                .get("content",{}).get("parts",[{}])[0]
+                .get("inlineData",{}).get("data")
+            )
+            if not b64_audio: raise ValueError("Gemini returned no audio data")
+            with open(mp3_path,"wb") as f: f.write(base64.b64decode(b64_audio))
+
+        else:
+            voice = data.get("voice","bn-IN-TanishaaNeural")
+            pitch = data.get("pitch","-5Hz")
+            rate  = data.get("rate","+12%")
+            async def _synth():
+                comm = edge_tts.Communicate(text, voice, pitch=pitch, rate=rate)
+                await comm.save(mp3_path)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:    loop.run_until_complete(_synth())
+            finally: loop.close()
+
+        if not os.path.exists(mp3_path) or os.path.getsize(mp3_path) < 100:
+            raise ValueError("TTS returned empty output")
+
+        fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        subprocess.run(
+            ["ffmpeg","-y","-i",mp3_path,"-ar","24000","-ac","1","-sample_fmt","s16",wav_path],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        with open(wav_path,"rb") as f: wav_bytes = f.read()
+        pcm_bytes = wav_bytes[44:]
+        return jsonify({"pcm_b64": base64.b64encode(pcm_bytes).decode(), "sample_rate": 24000})
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        for p in (mp3_path, wav_path):
+            if p and os.path.exists(p):
+                try: os.unlink(p)
+                except Exception: pass
+
+@app.route("/dub", methods=["POST"])
+def dub():
+    data      = request.get_json(force=True)
+    video_url = (data.get("video_url") or "").strip()
+    segments  = data.get("segments", [])
+    if not video_url: return jsonify({"error": "video_url required"}), 400
+    if not segments:  return jsonify({"error": "segments required"}), 400
+
+    job_id  = f"dub_{uuid.uuid4().hex[:8]}"
+    job_dir = os.path.join(TEMP_DIR, job_id)
+    Path(job_dir).mkdir(parents=True, exist_ok=True)
+    video_path = os.path.join(job_dir, "original.mp4")
+    out_path   = os.path.join(job_dir, "dubbed.mp4")
+
+    try:
+        platform = get_platform(video_url)
+        if platform == 'kuaishou':
+            video_dl_url, _, _ = asyncio.run(get_ks_video_url(video_url))
+            asyncio.run(download_video(video_dl_url, video_path))
+        else:
+            video_path = ytdlp_download(video_url, job_dir)
+
+        probe = subprocess.run(
+            ["ffprobe","-v","quiet","-print_format","json","-show_format",video_path],
+            capture_output=True, text=True, check=True
+        )
+        duration = float(json.loads(probe.stdout)["format"]["duration"])
+
+        base_audio = os.path.join(job_dir,"base.wav")
+        subprocess.run([
+            "ffmpeg","-y","-f","lavfi","-i",f"anullsrc=r=24000:cl=mono",
+            "-t",str(duration),base_audio
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        seg_files = []
+        for i, seg in enumerate(segments):
+            start      = float(seg["start"])
+            end        = float(seg["end"])
+            pcm_b64    = seg.get("pcm_b64","")
+            sr         = int(seg.get("sample_rate",24000))
+            target_dur = max(0.2, end - start)
+            if not pcm_b64: continue
+
+            pcm_bytes = base64.b64decode(pcm_b64)
+            num_channels=1; bits_per_sample=16
+            data_size=len(pcm_bytes)
+            byte_rate=sr*num_channels*(bits_per_sample//8)
+            block_align=num_channels*(bits_per_sample//8)
+            chunk_size=36+data_size
+            header = struct.pack(
+                "<4sI4s4sIHHIIHH4sI",
+                b"RIFF",chunk_size,b"WAVE",b"fmt ",16,1,
+                num_channels,sr,byte_rate,block_align,bits_per_sample,b"data",data_size
+            )
+            raw_wav = os.path.join(job_dir,f"seg_{i}_raw.wav")
+            with open(raw_wav,"wb") as f: f.write(header+pcm_bytes)
+
+            probe2 = subprocess.run(
+                ["ffprobe","-v","quiet","-print_format","json","-show_streams",raw_wav],
+                capture_output=True, text=True
+            )
+            try:    tts_dur = float(json.loads(probe2.stdout)["streams"][0]["duration"])
+            except: tts_dur = target_dur
+
+            ratio = max(0.5, min(2.0, tts_dur / target_dur))
+            atempo_filters = []
+            r = ratio
+            while r > 2.0:  atempo_filters.append("atempo=2.0"); r /= 2.0
+            while r < 0.5:  atempo_filters.append("atempo=0.5"); r /= 0.5
+            atempo_filters.append(f"atempo={r:.4f}")
+
+            fit_wav = os.path.join(job_dir,f"seg_{i}_fit.wav")
+            subprocess.run(
+                ["ffmpeg","-y","-i",raw_wav,"-af",",".join(atempo_filters),fit_wav],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            seg_files.append({"path": fit_wav, "start": start})
+
+        if seg_files:
+            filter_parts = []
+            inputs = ["-i", base_audio]
+            for idx, sf in enumerate(seg_files):
+                inputs += ["-i", sf["path"]]
+                delay_ms = int(sf["start"] * 1000)
+                filter_parts.append(f"[{idx+1}]adelay={delay_ms}|{delay_ms}[d{idx}]")
+            mixed_labels = "[0]" + "".join(f"[d{i}]" for i in range(len(seg_files)))
+            filter_parts.append(f"{mixed_labels}amix=inputs={len(seg_files)+1}:normalize=0[aout]")
+            mixed_audio = os.path.join(job_dir,"mixed.wav")
+            subprocess.run(
+                ["ffmpeg","-y"] + inputs +
+                ["-filter_complex",";".join(filter_parts),"-map","[aout]",mixed_audio],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        else:
+            mixed_audio = base_audio
+
+        subprocess.run([
+            "ffmpeg","-y","-i",video_path,"-i",mixed_audio,
+            "-c:v","copy","-c:a","aac","-b:a","128k",
+            "-map","0:v:0","-map","1:a:0","-shortest",out_path
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        return jsonify({"video_url": f"/dub_video/{job_id}/dubbed.mp4", "job_id": job_id})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/dub_video/<job_id>/<filename>")
+def serve_dub_video(job_id, filename):
+    return send_from_directory(os.path.join(TEMP_DIR, job_id), filename)
 
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
+
+# ─── Setup routes ─────────────────────────────────────────────────────────────
+
+ALLOWED_CONFIG_KEYS = {
+    "VMESS_LINK","YTDLP_PROXY","COOKIES_FILE",
+    "GROQ_API_KEY","KS_COOKIES","KS_PROXY",
+}
+
+@app.route("/setup/status")
+def setup_status():
+    cookies = os.environ.get("COOKIES_FILE", COOKIES_FILE)
+    cookie_exists = os.path.exists(cookies) and os.path.getsize(cookies) > 100
+    return jsonify({
+        "cookies": {"exists": cookie_exists, "size": os.path.getsize(cookies) if cookie_exists else 0},
+        "proxy":   {"configured": bool(os.environ.get("YTDLP_PROXY")), "url": os.environ.get("YTDLP_PROXY","")},
+        "vmess":   {"set": bool(os.environ.get("VMESS_LINK"))},
+        "xray_bin": os.path.exists(XRAY_BIN),
+    })
+
+@app.route("/setup/config", methods=["GET"])
+def setup_config_get():
+    cfg = load_config()
+    if "VMESS_LINK" in cfg: cfg["VMESS_LINK"] = cfg["VMESS_LINK"][:20] + "…"
+    return jsonify(cfg)
+
+@app.route("/setup/config", methods=["POST"])
+def setup_config_post():
+    incoming = request.get_json(force=True) or {}
+    current  = load_config()
+    xray_changed = False
+    for k, v in incoming.items():
+        if k not in ALLOWED_CONFIG_KEYS: continue
+        if not v:
+            current.pop(k, None); os.environ.pop(k, None)
+        else:
+            current[k] = v.strip(); os.environ[k] = v.strip()
+        if k in ("VMESS_LINK","YTDLP_PROXY"): xray_changed = True
+    save_config(current)
+    if xray_changed:
+        link = current.get("VMESS_LINK","") or current.get("YTDLP_PROXY","")
+        if link: start_xray(link)
+        else: stop_xray()
+    return jsonify({"ok": True})
+
+@app.route("/setup/cookies", methods=["POST"])
+def setup_cookies():
+    data = request.get_json(force=True) or {}
+    content = data.get("cookies","").strip()
+    if not content: return jsonify({"error": "cookies required"}), 400
+    cookies_path = os.environ.get("COOKIES_FILE", COOKIES_FILE)
+    os.makedirs(os.path.dirname(cookies_path), exist_ok=True)
+    if not content.startswith("# Netscape"):
+        content = "# Netscape HTTP Cookie File\n" + content
+    open(cookies_path,"w").write(content)
+    return jsonify({"ok": True, "size": len(content)})
+
+@app.route("/setup/cookies", methods=["DELETE"])
+def setup_cookies_delete():
+    cookies_path = os.environ.get("COOKIES_FILE", COOKIES_FILE)
+    try: os.unlink(cookies_path)
+    except Exception: pass
+    return jsonify({"ok": True})
+
+@app.route("/setup/proxy-test", methods=["POST"])
+def setup_proxy_test():
+    proxy = os.environ.get("YTDLP_PROXY","")
+    if not proxy: return jsonify({"ok": False, "error": "No proxy configured"})
+    try:
+        r = subprocess.run(
+            ["curl","-x",proxy,"-s","--max-time","15",
+             "-o","/dev/null","-w","%{http_code}","https://api.ipify.org"],
+            capture_output=True, text=True, timeout=20)
+        ok = r.returncode == 0 and r.stdout.strip().startswith("2")
+        ip = None
+        if ok:
+            r2 = subprocess.run(
+                ["curl","-x",proxy,"-s","--max-time","10","https://api.ipify.org"],
+                capture_output=True, text=True, timeout=15)
+            ip = r2.stdout.strip()
+        return jsonify({"ok": ok, "ip": ip, "proxy": proxy})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
